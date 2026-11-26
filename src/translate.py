@@ -17,12 +17,12 @@ from __future__ import annotations
 import json
 import math
 import re
-import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from src.config import DEFAULT_CONFIG_PATH, load_engine_config, resolve_api_key
+from src.http_client import GeminiApiError, post_json
 from src.profile import (
     load_profile,
     merge_glossaries,
@@ -37,52 +37,6 @@ DEFAULT_TRANSLATE_MODELS: tuple[dict[str, str], ...] = (
     {"model": "gemini-3.8-flash", "service_tier": "standard"},
     {"model": "gemini-3.5-flash-lite", "service_tier": "standard"},
 )
-
-
-class GeminiApiError(RuntimeError):
-    def __init__(self, code: str, message: str, *, http_status: int | None = None):
-        super().__init__(f"Gemini API 错误 ({code}): {message}")
-        self.code = str(code)
-        self.message = str(message)
-        self.http_status = http_status
-
-    @property
-    def is_503_transient(self) -> bool:
-        c = self.code.lower()
-        m = self.message.lower()
-        return (
-            self.http_status in (500, 502, 503, 504)
-            or any(k in c for k in ("503", "500", "unavailable", "internal", "overloaded"))
-            or any(k in m for k in ("high demand", "temporarily unavailable", "try again later"))
-        )
-
-    @property
-    def is_429_rate_limit(self) -> bool:
-        c = self.code.lower()
-        m = self.message.lower()
-        return (
-            self.http_status == 429
-            or any(k in c for k in ("429", "resource_exhausted", "too_many_requests", "rate"))
-            or any(k in m for k in ("rate limit", "quota", "resource exhausted"))
-        )
-
-    @property
-    def is_daily_quota_exhausted(self) -> bool:
-        if not self.is_429_rate_limit:
-            return False
-        m = self.message.lower()
-        if any(k in m for k in ("per day", "daily", "rpd", "requestsperday")):
-            return True
-        return self.retry_after_seconds is None
-
-    @property
-    def retry_after_seconds(self) -> int | None:
-        m = re.search(r"retry in\s+(\d+)\s*s", self.message.lower())
-        if m:
-            val = int(m.group(1))
-            if 0 < val <= 65:
-                return val
-        return None
 
 
 def split_cues_evenly(cues: list[SrtCue], max_per_batch: int = 280) -> list[list[SrtCue]]:
@@ -125,40 +79,6 @@ def normalize_translate_chain(
             seen.add(key)
             chain.append(key)
     return chain
-
-
-def _curl_post_json(
-    url: str,
-    payload: dict[str, Any],
-    *,
-    api_key: str,
-    proxy: str = "",
-    timeout: int = 180,
-) -> dict[str, Any]:
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    cmd = [
-        "curl", "-sS", "--max-time", str(timeout),
-        "-X", "POST",
-        "-H", "Content-Type: application/json",
-        "-H", f"x-goog-api-key: {api_key}",
-    ]
-    if proxy:
-        cmd.extend(["-x", proxy])
-    cmd.extend(["--data-binary", "@-", url])
-    res = subprocess.run(cmd, input=body, capture_output=True, check=False)
-    if res.returncode != 0:
-        raise GeminiApiError(
-            f"curl_{res.returncode}",
-            res.stderr.decode("utf-8", errors="replace").strip()[:300],
-            http_status=503 if res.returncode != 7 else None,
-        )
-    data = json.loads(res.stdout.decode("utf-8"))
-    if "error" in data:
-        err = data["error"]
-        code = err.get("code", "unknown")
-        status_int = int(code) if isinstance(code, int) or (isinstance(code, str) and code.isdigit()) else None
-        raise GeminiApiError(str(code), str(err.get("message") or ""), http_status=status_int)
-    return data
 
 
 def _extract_dict_translation(row: dict[str, Any]) -> tuple[str, str | None]:
@@ -277,7 +197,7 @@ class SubtitleTranslator:
         self.proxy = proxy
         self.timeout = timeout
         self.sleep_fn = sleep_fn
-        self.post_fn = post_fn or _curl_post_json
+        self.post_fn = post_fn or post_json
         self.progress_fn = progress_fn
         self.exhausted_models: set[tuple[str, str]] = set()
         self.stats: list[dict[str, Any]] = []

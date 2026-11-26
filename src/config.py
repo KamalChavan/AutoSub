@@ -1,14 +1,51 @@
-"""Engine configuration, binary resolution, and Gemini API key discovery."""
+"""Engine configuration, frozen-bundle path resolution, binary lookup, and API key discovery."""
 from __future__ import annotations
 
 import os
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+def is_frozen() -> bool:
+    """Return True when running inside a PyInstaller packaged executable."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def get_app_root() -> Path:
+    """Editable application root (directory containing autosub.exe when frozen, repo root in dev)."""
+    if is_frozen():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def get_bundle_root() -> Path:
+    """Read-only bundled internal resource root (_MEIPASS when frozen, repo root in dev)."""
+    if is_frozen():
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(meipass).resolve()
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def get_user_config_dir() -> Path:
+    """Per-user config directory (`%APPDATA%/AutoSub` on Windows, `~/.config/autosub` elsewhere)."""
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA", "").strip()
+        if appdata:
+            return Path(appdata) / "AutoSub"
+        return Path.home() / "AppData" / "Roaming" / "AutoSub"
+    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    if xdg:
+        return Path(xdg) / "autosub"
+    return Path.home() / ".config" / "autosub"
+
+
+PROJECT_ROOT = get_app_root()
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "defaults.yaml"
 PROFILES_DIR = PROJECT_ROOT / "profiles"
 
@@ -22,13 +59,37 @@ def load_yaml(path: Path) -> dict[str, Any]:
 def load_engine_config(defaults_path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
     if defaults_path.is_file():
         return load_yaml(defaults_path)
+    bundled_fallback = get_bundle_root() / "config" / "defaults.yaml"
+    if bundled_fallback.is_file():
+        return load_yaml(bundled_fallback)
     return {}
 
 
-def resolve_binary(configured: str, candidates: list[str]) -> str:
+def resolve_binary(
+    configured: str,
+    candidates: list[str],
+    *,
+    app_root: Path | None = None,
+    bundle_root: Path | None = None,
+) -> str:
+    """Resolve an external binary: explicit config -> bundled `bin/` -> system PATH."""
     cleaned = (configured or "").strip()
     if cleaned:
         return cleaned
+
+    roots: list[Path] = []
+    for root in (app_root or get_app_root(), bundle_root or get_bundle_root()):
+        if root not in roots:
+            roots.append(root)
+
+    for root in roots:
+        for sub in ("bin", ""):
+            base = (root / sub) if sub else root
+            for name in candidates:
+                cand = base / name
+                if cand.is_file():
+                    return str(cand)
+
     for name in candidates:
         found = shutil.which(name)
         if found:
@@ -55,16 +116,24 @@ def _read_key_from_dotenv(env_path: Path) -> str:
 def resolve_api_key(
     configured_key: str = "",
     *,
-    project_root: Path = PROJECT_ROOT,
+    project_root: Path | None = None,
+    user_config_dir: Path | None = None,
 ) -> str:
-    """Resolve Gemini API key: config -> env vars -> project/.env -> cwd/.env."""
+    """Resolve Gemini API key: config -> env vars -> cwd/.env -> app_root/.env -> user_config/.env."""
     if (configured_key or "").strip():
         return configured_key.strip()
     for env_name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
         val = os.environ.get(env_name, "").strip()
         if val:
             return val
-    for candidate in (project_root / ".env", Path.cwd() / ".env"):
+    root = project_root or get_app_root()
+    uconf = user_config_dir or get_user_config_dir()
+    seen: set[Path] = set()
+    for candidate in (Path.cwd() / ".env", root / ".env", uconf / ".env"):
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
         val = _read_key_from_dotenv(candidate)
         if val:
             return val

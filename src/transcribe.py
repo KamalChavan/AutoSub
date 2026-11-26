@@ -8,8 +8,6 @@ timeline, and writes `.srt` incrementally after each chunk.
 from __future__ import annotations
 
 import importlib.util
-import json
-import re
 import subprocess
 import tempfile
 import time
@@ -17,9 +15,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from src.config import DEFAULT_CONFIG_PATH, load_engine_config, resolve_api_key, resolve_binary
+from src.http_client import GeminiApiError, delete_url, post_json, upload_resumable_file
 from src.profile import load_profile
 from src.srt import append_srt_cues, group_words_to_cues, map_word_to_original
-from src.translate import GeminiApiError
 from src.vad import (
     SR,
     detect_speech_segments_silencedetect,
@@ -32,13 +30,6 @@ from src.vad import (
 DEFAULT_TRANSCRIBE_MODEL = "gemini-3.5-transcribe"
 
 
-def _curl_base(api_key: str, proxy: str, timeout: int = 360) -> list[str]:
-    cmd = ["curl", "-sS", "--max-time", str(timeout), "-H", f"x-goog-api-key: {api_key}"]
-    if proxy:
-        cmd.extend(["-x", proxy])
-    return cmd
-
-
 def upload_audio_to_files_api(
     audio_path: Path,
     *,
@@ -46,52 +37,14 @@ def upload_audio_to_files_api(
     api_base: str = "https://generativelanguage.googleapis.com/v1beta",
     proxy: str = "",
 ) -> dict[str, Any]:
-    size = audio_path.stat().st_size
-    upload_origin = api_base.rstrip("/").replace("/v1beta", "/upload/v1beta")
-    with tempfile.NamedTemporaryFile(suffix=".hdr", delete=False) as tf:
-        hdr_path = Path(tf.name)
-    try:
-        meta = json.dumps({"file": {"display_name": audio_path.name}}).encode("utf-8")
-        res = subprocess.run(
-            _curl_base(api_key, proxy, timeout=60) + [
-                "-D", str(hdr_path), "-X", "POST",
-                "-H", "X-Goog-Upload-Protocol: resumable",
-                "-H", "X-Goog-Upload-Command: start",
-                "-H", f"X-Goog-Upload-Header-Content-Length: {size}",
-                "-H", "X-Goog-Upload-Header-Content-Type: audio/mp3",
-                "-H", "Content-Type: application/json",
-                "--data-binary", "@-",
-                f"{upload_origin}/files",
-            ],
-            input=meta, capture_output=True, check=False,
-        )
-        if res.returncode != 0:
-            raise RuntimeError(f"Files API 启动上传失败: {res.stderr.decode('utf-8', errors='replace')[:300]}")
-        m = re.search(r"(?im)^x-goog-upload-url:\s*(\S+)", hdr_path.read_text(encoding="utf-8", errors="replace"))
-        if not m:
-            raise RuntimeError("Files API 未返回 x-goog-upload-url")
-        upload_url = m.group(1).strip()
-    finally:
-        hdr_path.unlink(missing_ok=True)
-
-    res2 = subprocess.run(
-        _curl_base(api_key, proxy, timeout=300) + [
-            "-X", "POST",
-            "-H", f"Content-Length: {size}",
-            "-H", "X-Goog-Upload-Offset: 0",
-            "-H", "X-Goog-Upload-Command: upload, finalize",
-            "--data-binary", f"@{audio_path}",
-            upload_url,
-        ],
-        capture_output=True, check=False,
+    return upload_resumable_file(
+        audio_path,
+        mime_type="audio/mp3",
+        api_key=api_key,
+        api_base=api_base,
+        proxy=proxy,
+        timeout=300,
     )
-    if res2.returncode != 0:
-        raise RuntimeError(f"Files API 上传数据失败: {res2.stderr.decode('utf-8', errors='replace')[:300]}")
-    data = json.loads(res2.stdout.decode("utf-8"))
-    if "error" in data:
-        err = data["error"]
-        raise GeminiApiError(str(err.get("code", "upload_error")), str(err.get("message") or ""))
-    return data.get("file", data)
 
 
 def delete_remote_file(
@@ -103,9 +56,11 @@ def delete_remote_file(
 ) -> None:
     if not file_name:
         return
-    subprocess.run(
-        _curl_base(api_key, proxy, timeout=30) + ["-X", "DELETE", f"{api_base.rstrip('/')}/{file_name}"],
-        capture_output=True, check=False,
+    delete_url(
+        f"{api_base.rstrip('/')}/{file_name}",
+        api_key=api_key,
+        proxy=proxy,
+        timeout=30,
     )
 
 
@@ -118,6 +73,7 @@ def call_gemini_transcribe(
     proxy: str = "",
     max_retries: int = 6,
     sleep_fn: Callable[[float], None] = time.sleep,
+    post_fn: Callable[..., dict[str, Any]] | None = None,
     progress_fn: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Call `/v1beta/interactions` with verbatim mode + word-level timestamps."""
@@ -134,31 +90,14 @@ def call_gemini_transcribe(
             }
         },
     }
-    body = json.dumps(payload).encode("utf-8")
     url = f"{api_base.rstrip('/')}/interactions"
+    requester = post_fn or post_json
     last_err: Exception | None = None
 
     for attempt in range(1, max(1, max_retries) + 1):
-        res = subprocess.run(
-            _curl_base(api_key, proxy, timeout=360) + [
-                "-X", "POST", "-H", "Content-Type: application/json",
-                "--data-binary", "@-", url,
-            ],
-            input=body, capture_output=True, check=False,
-        )
-        if res.returncode != 0:
-            last_err = RuntimeError(res.stderr.decode("utf-8", errors="replace")[:300])
-            if attempt < max_retries:
-                wait_s = min(30, 8 * attempt)
-                if progress_fn:
-                    progress_fn(f"    [转写重试 {attempt}/{max_retries}] curl 错误 ({res.returncode})，{wait_s}s 后重试...")
-                sleep_fn(wait_s)
-                continue
-            raise last_err
-        resp = json.loads(res.stdout.decode("utf-8"))
-        if "error" in resp:
-            err = resp["error"]
-            api_err = GeminiApiError(str(err.get("code", "unknown")), str(err.get("message") or ""))
+        try:
+            return requester(url, payload, api_key=api_key, proxy=proxy, timeout=360)
+        except GeminiApiError as api_err:
             last_err = api_err
             if api_err.is_429_rate_limit and api_err.retry_after_seconds is not None and attempt < max_retries:
                 wait_s = api_err.retry_after_seconds + 3
@@ -172,8 +111,16 @@ def call_gemini_transcribe(
                     progress_fn(f"    [转写高负载 {attempt}/{max_retries}] 遇到 {api_err.code}，{wait_s}s 后重试...")
                 sleep_fn(wait_s)
                 continue
-            raise api_err
-        return resp
+            raise
+        except Exception as exc:
+            last_err = exc
+            if attempt < max_retries:
+                wait_s = min(30, 8 * attempt)
+                if progress_fn:
+                    progress_fn(f"    [转写重试 {attempt}/{max_retries}] 网络/异常 ({type(exc).__name__})，{wait_s}s 后重试...")
+                sleep_fn(wait_s)
+                continue
+            raise
     raise RuntimeError(f"gemini-3.5-transcribe 调用失败: {last_err}")
 
 

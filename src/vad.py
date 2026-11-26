@@ -7,17 +7,32 @@ import re
 import subprocess
 from pathlib import Path
 
+from src.config import get_app_root, get_bundle_root
+
 SR = 16000
 SILERO_WINDOW = 512
 SILERO_CONTEXT = 64
 
 
-def find_silero_onnx_model(explicit_path: Path | None = None) -> Path | None:
+def find_silero_onnx_model(
+    explicit_path: Path | None = None,
+    *,
+    app_root: Path | None = None,
+    bundle_root: Path | None = None,
+) -> Path | None:
     if explicit_path and explicit_path.is_file():
         return explicit_path
     env_p = os.environ.get("SILERO_VAD_ONNX", "").strip()
     if env_p and Path(env_p).is_file():
         return Path(env_p)
+    for root in (app_root or get_app_root(), bundle_root or get_bundle_root()):
+        for rel in (
+            Path("models") / "silero_vad.onnx",
+            Path("silero_vad") / "data" / "silero_vad.onnx",
+        ):
+            cand = root / rel
+            if cand.is_file():
+                return cand
     spec = importlib.util.find_spec("silero_vad")
     if spec and spec.submodule_search_locations:
         for loc in spec.submodule_search_locations:

@@ -1,17 +1,19 @@
 """Comprehensive offline unit tests for AutoSub (zero live network calls)."""
 from __future__ import annotations
 
+import io
 import json
-import subprocess
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
 import yaml
 
 import main as autosub_main
-from src.config import PROJECT_ROOT, load_engine_config, resolve_api_key
+from src.config import PROJECT_ROOT, load_engine_config, resolve_api_key, resolve_binary
+from src.http_client import GeminiApiError, post_json, upload_resumable_file
 from src.profile import (
     list_profiles,
     load_glossary,
@@ -34,14 +36,13 @@ from src.srt import (
 from src.transcribe import call_gemini_transcribe, extract_words_from_interaction
 from src.translate import (
     DEFAULT_TRANSLATE_MODELS,
-    GeminiApiError,
     SubtitleTranslator,
     _parse_compact_translation,
     format_cue_lines,
     normalize_translate_chain,
     split_cues_evenly,
 )
-from src.vad import pack_segments_into_chunks
+from src.vad import find_silero_onnx_model, pack_segments_into_chunks
 
 
 def _mk_resp(payload_obj: dict, *, tier: str = "STANDARD", in_tok: int = 120, out_tok: int = 45) -> dict:
@@ -220,18 +221,28 @@ class TestSrtAndVad(unittest.TestCase):
 
     def test_transcribe_retries_on_503_and_429(self) -> None:
         sleeps: list[float] = []
-        responses = [
-            subprocess.CompletedProcess([], 0, stdout=json.dumps({"error": {"code": "service_unavailable", "message": "high demand"}}).encode(), stderr=b""),
-            subprocess.CompletedProcess([], 0, stdout=json.dumps({"error": {"code": "too_many_requests", "message": "Please retry in 5s"}}).encode(), stderr=b""),
-            subprocess.CompletedProcess([], 0, stdout=json.dumps({"steps": []}).encode(), stderr=b""),
+        side_effects = [
+            GeminiApiError("service_unavailable", "high demand", http_status=503),
+            GeminiApiError("too_many_requests", "Please retry in 5s", http_status=429),
+            {"steps": []},
         ]
-        with mock.patch("src.transcribe.subprocess.run", side_effect=responses):
-            out = call_gemini_transcribe(
-                "https://example.com/files/abc",
-                api_key="test",
-                max_retries=5,
-                sleep_fn=sleeps.append,
-            )
+        idx = 0
+
+        def fake_post(url: str, payload: dict, **_kw) -> dict:
+            nonlocal idx
+            item = side_effects[idx]
+            idx += 1
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        out = call_gemini_transcribe(
+            "https://example.com/files/abc",
+            api_key="test",
+            max_retries=5,
+            sleep_fn=sleeps.append,
+            post_fn=fake_post,
+        )
         self.assertEqual(out, {"steps": []})
         self.assertEqual(sleeps, [8, 8])
 
@@ -364,6 +375,101 @@ class TestCliParser(unittest.TestCase):
 
         a_prof = parser.parse_args(["profiles"])
         self.assertEqual(a_prof.command, "profiles")
+
+        a_doc = parser.parse_args(["doctor", "--strict-bundle"])
+        self.assertEqual(a_doc.command, "doctor")
+        self.assertTrue(a_doc.strict_bundle)
+
+
+class TestWindowsBundleAndHttpClient(unittest.TestCase):
+    def test_resolve_binary_prefers_bundled_bin_and_silero_finds_bundled_onnx(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            app_root = Path(td) / "app"
+            bundle_root = app_root / "_internal"
+            (app_root / "bin").mkdir(parents=True)
+            (bundle_root / "models").mkdir(parents=True)
+            fake_ffmpeg = app_root / "bin" / "ffmpeg.exe"
+            fake_ffmpeg.write_bytes(b"MZ")
+            fake_onnx = bundle_root / "models" / "silero_vad.onnx"
+            fake_onnx.write_bytes(b"ONNX")
+
+            resolved = resolve_binary(
+                "",
+                ["ffmpeg.exe", "ffmpeg"],
+                app_root=app_root,
+                bundle_root=bundle_root,
+            )
+            self.assertEqual(Path(resolved), fake_ffmpeg)
+
+            with mock.patch.dict("os.environ", {}, clear=True):
+                found_onnx = find_silero_onnx_model(app_root=app_root, bundle_root=bundle_root)
+            self.assertEqual(found_onnx, fake_onnx)
+
+    def test_resolve_api_key_falls_back_to_user_config_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            app_root = Path(td) / "app"
+            user_cfg = Path(td) / "appdata"
+            app_root.mkdir()
+            user_cfg.mkdir()
+            (user_cfg / ".env").write_text("GEMINI_API_KEY=from_appdata\n", encoding="utf-8")
+            with mock.patch.dict("os.environ", {}, clear=True):
+                self.assertEqual(
+                    resolve_api_key("", project_root=app_root, user_config_dir=user_cfg),
+                    "from_appdata",
+                )
+
+    def test_pure_python_http_client_post_and_resumable_upload(self) -> None:
+        class FakeResp:
+            def __init__(self, body: bytes, headers: dict[str, str] | None = None):
+                self._body = body
+                self.headers = headers or {}
+
+            def read(self) -> bytes:
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        # 1. post_json success + HTTP 429 error parsing
+        fake_opener = mock.MagicMock()
+        fake_opener.open.return_value = FakeResp(json.dumps({"ok": True}).encode())
+        with mock.patch("src.http_client._build_opener", return_value=fake_opener):
+            self.assertEqual(post_json("https://example.com/x", {"a": 1}, api_key="k"), {"ok": True})
+
+        err_body = io.BytesIO(json.dumps({"error": {"code": 429, "message": "Quota exceeded per day"}}).encode())
+        http_err = urllib.error.HTTPError("https://example.com/x", 429, "Too Many Requests", {}, err_body)
+        fake_opener.open.side_effect = http_err
+        with mock.patch("src.http_client._build_opener", return_value=fake_opener):
+            with self.assertRaises(GeminiApiError) as ctx:
+                post_json("https://example.com/x", {"a": 1}, api_key="k")
+        self.assertTrue(ctx.exception.is_429_rate_limit)
+        self.assertTrue(ctx.exception.is_daily_quota_exhausted)
+
+        # 2. upload_resumable_file 2-step flow
+        with tempfile.TemporaryDirectory() as td:
+            mp3 = Path(td) / "chunk.mp3"
+            mp3.write_bytes(b"ID3fakeaudio")
+            upload_opener = mock.MagicMock()
+            upload_opener.open.side_effect = [
+                FakeResp(b"", headers={"x-goog-upload-url": "https://upload.example.com/session1"}),
+                FakeResp(json.dumps({"file": {"name": "files/123", "uri": "https://example.com/files/123"}}).encode()),
+            ]
+            with mock.patch("src.http_client._build_opener", return_value=upload_opener):
+                finfo = upload_resumable_file(mp3, api_key="k")
+            self.assertEqual(finfo["name"], "files/123")
+            self.assertEqual(finfo["uri"], "https://example.com/files/123")
+
+    def test_windows_packaging_files_exist_and_workflow_valid_yaml(self) -> None:
+        self.assertTrue((PROJECT_ROOT / "packaging" / "windows" / "autosub.spec").is_file())
+        self.assertTrue((PROJECT_ROOT / "packaging" / "windows" / "autosub.iss").is_file())
+        self.assertTrue((PROJECT_ROOT / "packaging" / "windows" / "build_windows.ps1").is_file())
+        wf_path = PROJECT_ROOT / ".github" / "workflows" / "build-windows.yml"
+        self.assertTrue(wf_path.is_file())
+        wf = yaml.safe_load(wf_path.read_text(encoding="utf-8"))
+        self.assertIn("build-windows", wf["jobs"])
 
 
 if __name__ == "__main__":

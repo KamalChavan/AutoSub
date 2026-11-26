@@ -18,9 +18,44 @@
    - 默认链：`gemini-4-hydrogen (standard) -> gemini-3.8-flash (standard) -> gemini-3.5-flash-lite (standard)`。
    - 遇到 `503` 高负载时当前模型原地尝试 3 次后再向下切换；遇到 `429` 当日 RPD 额度耗尽时当轮直接熔断跳过。
 
-## 安装依赖
+## 安装方式
 
-需要系统已安装 `ffmpeg` 和 `curl`，Python `>= 3.10`：
+### 方式 A：Windows 一键安装包（推荐，免装 Python / Silero / FFmpeg）
+
+Windows 安装包（`AutoSub-Setup-<version>-win64.exe`）与绿色便携版（`AutoSub-<version>-win64-portable.zip`）已内置全部运行依赖：
+- 独立 Python 运行时 + `PyYAML` + `onnxruntime` + `numpy` + `certifi`（纯 Python HTTPS，无需 `curl`，也无需 PyTorch）
+- Silero VAD ONNX 模型（`models/silero_vad.onnx`）
+- 静态版 `ffmpeg.exe`（`bin/ffmpeg.exe`）
+- 可直接编辑的 `config/defaults.yaml`、`profiles/*.yaml` 与 `glossaries/*.yaml`
+
+安装后默认自动加入用户 `PATH`（无需管理员权限），打开任意 PowerShell / 终端即可直接运行：
+
+```powershell
+# 1. 环境自检（确认 FFmpeg、Silero ONNX 与内置 Profile 均就绪）
+autosub doctor
+
+# 2. 填入 Gemini API Key（任选其一）：
+#    - 在安装目录（或 %APPDATA%\AutoSub\）新建 .env，写入 GEMINI_API_KEY=你的Key
+#    - 或在系统环境变量设置 GEMINI_API_KEY
+
+# 3. 直接转录与翻译
+autosub run P02_死灵龙.mp4 --profile twitch_dota2 --var hero="Visage / 死灵龙" --var streamer="4oapm"
+```
+
+#### 如何构建 Windows 安装包
+
+- **云端自动打包（推荐，无需本地 Windows 环境）**：将 `AutoSub` 推送到 GitHub 后，在 Actions 页面手动触发 `Build Windows Installer`（或推送 `v0.1.0` 标签自动发布 GitHub Release），即可直接下载 `AutoSub-Setup-<version>-win64.exe` 与 `AutoSub-<version>-win64-portable.zip`。
+- **在 Windows 本地一键打包**：安装 Python 3.10+ 与 [Inno Setup 6](https://jrsoftware.org/isinfo.php)（`winget install JRSoftware.InnoSetup`），在仓库根目录执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\build_windows.ps1
+```
+
+脚本会自动创建隔离环境、安装 `onnxruntime` / `silero-vad (--no-deps)`、自动下载静态 `ffmpeg.exe`、运行 `autosub.exe doctor --strict-bundle` 验收，并在 `dist/` 目录生成 `.exe` 安装包与绿色 `.zip`。
+
+### 方式 B：Linux / macOS / 源码方式安装
+
+需要系统已安装 `ffmpeg`，Python `>= 3.10`（纯 Python HTTPS 请求，不再依赖外部 `curl`）：
 
 ```bash
 pip install -r requirements.txt
