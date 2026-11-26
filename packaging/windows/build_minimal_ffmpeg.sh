@@ -22,7 +22,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-OUT_PATH="${1:-${PROJECT_ROOT}/build/cache/ffmpeg-minimal.exe}"
+RAW_OUT_PATH="${1:-${PROJECT_ROOT}/build/cache/ffmpeg-minimal.exe}"
+mkdir -p "$(dirname "$RAW_OUT_PATH")"
+OUT_PATH="$(cd "$(dirname "$RAW_OUT_PATH")" && pwd)/$(basename "$RAW_OUT_PATH")"
 
 FFMPEG_VERSION="${FFMPEG_VERSION:-7.1.1}"
 LAME_VERSION="${LAME_VERSION:-3.100}"
