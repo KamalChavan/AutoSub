@@ -44,14 +44,19 @@ autosub run P02_死灵龙.mp4 --profile twitch_dota2 --var hero="Visage / 死灵
 
 #### 如何构建 Windows 安装包
 
-- **云端自动打包（推荐，无需本地 Windows 环境）**：将 `AutoSub` 推送到 GitHub 后，在 Actions 页面手动触发 `Build Windows Installer`（或推送 `v0.1.0` 标签自动发布 GitHub Release），即可直接下载 `AutoSub-Setup-<version>-win64.exe` 与 `AutoSub-<version>-win64-portable.zip`。
-- **在 Windows 本地一键打包**：安装 Python 3.10+ 与 [Inno Setup 6](https://jrsoftware.org/isinfo.php)（`winget install JRSoftware.InnoSetup`），在仓库根目录执行：
+- **云端自动打包（推荐，默认使用 ~4–6 MB 音频精简版 FFmpeg）**：将 `AutoSub` 推送到 GitHub 后，在 Actions 页面手动触发 `Build Windows Installer`（或推送 `v0.1.0` 标签自动发布 GitHub Release），CI 会先自动交叉编译仅含音频编解码的极简 `ffmpeg.exe`（体积从 106 MB 降至 ~4–6 MB），再生成 `AutoSub-Setup-<version>-win64.exe`（约 24 MB）与绿色版 `.zip`。
+- **在 Windows / WSL 本地一键打包**：安装 Python 3.10+ 与 [Inno Setup 6](https://jrsoftware.org/isinfo.php)（`winget install JRSoftware.InnoSetup`），在仓库根目录执行：
 
 ```powershell
+# 可选（WSL/Linux 下先交叉编译 ~4–6 MB 精简音频版 ffmpeg.exe，避免打入 106 MB 完整版 FFmpeg）：
+#   sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 nasm make pkg-config curl tar xz-utils
+#   bash packaging/windows/build_minimal_ffmpeg.sh
+
+# 一键打包（若存在 build/cache/ffmpeg-minimal.exe 会自动优先使用；也可加 -NoBundleFfmpeg 复用本机 FFmpeg）
 powershell -ExecutionPolicy Bypass -File packaging\windows\build_windows.ps1
 ```
 
-脚本会自动创建隔离环境、安装 `onnxruntime` / `silero-vad (--no-deps)`、自动下载静态 `ffmpeg.exe`、运行 `autosub.exe doctor --strict-bundle` 验收，并在 `dist/` 目录生成 `.exe` 安装包与绿色 `.zip`。
+脚本会自动创建隔离环境、运行全部单元测试（任何测试失败即中止打包）、打包 `onnxruntime` / `silero_vad.onnx` / `ffmpeg.exe`、运行 `autosub.exe doctor --strict-bundle` 验收，并在 `dist/` 目录生成 `.exe` 安装包与绿色 `.zip`。
 
 ### 方式 B：Linux / macOS / 源码方式安装
 

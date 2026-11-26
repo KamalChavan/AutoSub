@@ -32,17 +32,23 @@ def get_bundle_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def get_user_config_dir() -> Path:
+def get_user_config_dir() -> Path | None:
     """Per-user config directory (`%APPDATA%/AutoSub` on Windows, `~/.config/autosub` elsewhere)."""
     if os.name == "nt":
         appdata = os.environ.get("APPDATA", "").strip()
         if appdata:
             return Path(appdata) / "AutoSub"
-        return Path.home() / "AppData" / "Roaming" / "AutoSub"
+        try:
+            return Path.home() / "AppData" / "Roaming" / "AutoSub"
+        except RuntimeError:
+            return None
     xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
     if xdg:
         return Path(xdg) / "autosub"
-    return Path.home() / ".config" / "autosub"
+    try:
+        return Path.home() / ".config" / "autosub"
+    except RuntimeError:
+        return None
 
 
 PROJECT_ROOT = get_app_root()
@@ -127,9 +133,12 @@ def resolve_api_key(
         if val:
             return val
     root = project_root or get_app_root()
-    uconf = user_config_dir or get_user_config_dir()
+    uconf = user_config_dir if user_config_dir is not None else get_user_config_dir()
+    candidates = [Path.cwd() / ".env", root / ".env"]
+    if uconf is not None:
+        candidates.append(uconf / ".env")
     seen: set[Path] = set()
-    for candidate in (Path.cwd() / ".env", root / ".env", uconf / ".env"):
+    for candidate in candidates:
         resolved = candidate.resolve()
         if resolved in seen:
             continue

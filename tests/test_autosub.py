@@ -75,8 +75,9 @@ class TestConfigAndProfiles(unittest.TestCase):
             root = Path(td)
             (root / ".env").write_text('GEMINI_API_KEY="from_dotenv"\n', encoding="utf-8")
             with mock.patch.dict("os.environ", {}, clear=True):
-                self.assertEqual(resolve_api_key("explicit", project_root=root), "explicit")
-                self.assertEqual(resolve_api_key("", project_root=root), "from_dotenv")
+                with mock.patch("pathlib.Path.home", side_effect=RuntimeError("no home")):
+                    self.assertEqual(resolve_api_key("explicit", project_root=root), "explicit")
+                    self.assertEqual(resolve_api_key("", project_root=root), "from_dotenv")
             with mock.patch.dict("os.environ", {"GEMINI_API_KEY": "from_env"}, clear=True):
                 self.assertEqual(resolve_api_key("", project_root=root), "from_env")
 

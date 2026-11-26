@@ -51,7 +51,7 @@ Name: "addtopath"; Description: "Add AutoSub to PATH (recommended so you can run
 ; Core executable, _internal runtime, Silero ONNX model, bundled FFmpeg
 Source: "{#SourceDir}\autosub.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#SourceDir}\bin\*"; DestDir: "{app}\bin"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\bin\*"; DestDir: "{app}\bin"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 Source: "{#SourceDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\.env.example"; DestDir: "{app}"; Flags: ignoreversion
 ; Editable user config, profiles & glossaries (preserve user edits on upgrade where appropriate)

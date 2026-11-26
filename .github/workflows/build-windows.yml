@@ -10,11 +10,40 @@ permissions:
   contents: write
 
 jobs:
+  build-minimal-ffmpeg:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 nasm make pkg-config curl tar xz-utils
+
+      - name: Cross-compile audio-only static Windows ffmpeg.exe (~4-6 MB)
+        run: |
+          bash packaging/windows/build_minimal_ffmpeg.sh build/cache/ffmpeg-minimal.exe
+
+      - name: Upload minimal ffmpeg.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-minimal-win64
+          path: build/cache/ffmpeg-minimal.exe
+          retention-days: 1
+
   build-windows:
+    needs: build-minimal-ffmpeg
     runs-on: windows-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Download audio-only minimal ffmpeg.exe
+        uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-minimal-win64
+          path: build/cache
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -24,7 +53,7 @@ jobs:
       - name: Build Windows portable ZIP and Inno Setup installer
         shell: pwsh
         run: |
-          .\packaging\windows\build_windows.ps1
+          .\packaging\windows\build_windows.ps1 -FfmpegPath build\cache\ffmpeg-minimal.exe
 
       - name: Upload Windows build artifacts
         uses: actions/upload-artifact@v4
