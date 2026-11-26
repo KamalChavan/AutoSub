@@ -7,7 +7,6 @@ timeline, and writes `.srt` incrementally after each chunk.
 """
 from __future__ import annotations
 
-import importlib.util
 import subprocess
 import tempfile
 import time
@@ -22,8 +21,8 @@ from src.vad import (
     SR,
     detect_speech_segments_silencedetect,
     detect_speech_segments_silero,
-    find_silero_onnx_model,
     pack_segments_into_chunks,
+    probe_silero_vad_runtime,
     render_chunk_mp3,
 )
 
@@ -194,19 +193,18 @@ def transcribe_media(
         total_dur = (pcm_path.stat().st_size // 4) / SR
 
         effective_vad = vad_mode
-        onnx_path = find_silero_onnx_model() if effective_vad == "silero_onnx" else None
-        if effective_vad == "silero_onnx":
-            has_ort = importlib.util.find_spec("onnxruntime") is not None and importlib.util.find_spec("numpy") is not None
-            if onnx_path is None or not has_ort:
-                print("[提示] 未检测到 onnxruntime/numpy 或 silero_vad.onnx，自动降级为 ffmpeg silencedetect", flush=True)
-                effective_vad = "silencedetect"
+        silero_ok, silero_backend, onnx_path, ort_lib = probe_silero_vad_runtime() if effective_vad == "silero_onnx" else (False, "", None, None)
+        if effective_vad == "silero_onnx" and not silero_ok:
+            print("[提示] 未检测到 ONNX Runtime 或 silero_vad.onnx，自动降级为 ffmpeg silencedetect", flush=True)
+            effective_vad = "silencedetect"
 
         if effective_vad == "silero_onnx":
             assert onnx_path is not None
-            print("[2/4] 正在运行本地 Silero VAD (ONNX) 裁剪无人声片段...", flush=True)
+            print(f"[2/4] 正在运行本地 Silero VAD (ONNX / {silero_backend}) 裁剪无人声片段...", flush=True)
             segments, total_dur = detect_speech_segments_silero(
                 pcm_path,
                 onnx_path=onnx_path,
+                ort_lib_path=ort_lib,
                 threshold=float(tr_cfg.get("vad_threshold", 0.35)),
                 neg_threshold=float(tr_cfg.get("vad_neg_threshold", 0.20)),
                 speech_pad_ms=int(tr_cfg.get("vad_speech_pad_ms", 500)),

@@ -42,7 +42,12 @@ from src.translate import (
     normalize_translate_chain,
     split_cues_evenly,
 )
-from src.vad import find_silero_onnx_model, pack_segments_into_chunks
+from src.vad import (
+    find_onnxruntime_library,
+    find_silero_onnx_model,
+    pack_segments_into_chunks,
+    probe_silero_vad_runtime,
+)
 
 
 def _mk_resp(payload_obj: dict, *, tier: str = "STANDARD", in_tok: int = 120, out_tok: int = 45) -> dict:
@@ -389,10 +394,13 @@ class TestWindowsBundleAndHttpClient(unittest.TestCase):
             bundle_root = app_root / "_internal"
             (app_root / "bin").mkdir(parents=True)
             (bundle_root / "models").mkdir(parents=True)
+            (bundle_root / "lib").mkdir(parents=True)
             fake_ffmpeg = app_root / "bin" / "ffmpeg.exe"
             fake_ffmpeg.write_bytes(b"MZ")
             fake_onnx = bundle_root / "models" / "silero_vad.onnx"
             fake_onnx.write_bytes(b"ONNX")
+            fake_ort = bundle_root / "lib" / ("onnxruntime.dll" if Path("C:/").drive or __import__("os").name == "nt" else "libonnxruntime.so")
+            fake_ort.write_bytes(b"ORT")
 
             resolved = resolve_binary(
                 "",
@@ -404,7 +412,14 @@ class TestWindowsBundleAndHttpClient(unittest.TestCase):
 
             with mock.patch.dict("os.environ", {}, clear=True):
                 found_onnx = find_silero_onnx_model(app_root=app_root, bundle_root=bundle_root)
+                found_ort = find_onnxruntime_library(app_root=app_root, bundle_root=bundle_root)
+                ok, backend, m_path, lib_path = probe_silero_vad_runtime(app_root=app_root, bundle_root=bundle_root)
             self.assertEqual(found_onnx, fake_onnx)
+            self.assertEqual(found_ort, fake_ort)
+            self.assertTrue(ok)
+            self.assertEqual(backend, "ctypes_capi")
+            self.assertEqual(m_path, fake_onnx)
+            self.assertEqual(lib_path, fake_ort)
 
     def test_resolve_api_key_falls_back_to_user_config_dir(self) -> None:
         with tempfile.TemporaryDirectory() as td:

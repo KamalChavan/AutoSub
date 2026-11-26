@@ -22,10 +22,11 @@
 
 ### 方式 A：Windows 一键安装包（推荐，免装 Python / Silero / FFmpeg）
 
-Windows 安装包（`AutoSub-Setup-<version>-win64.exe`）与绿色便携版（`AutoSub-<version>-win64-portable.zip`）已内置全部运行依赖：
-- 独立 Python 运行时 + `PyYAML` + `onnxruntime` + `numpy` + `certifi`（纯 Python HTTPS，无需 `curl`，也无需 PyTorch）
-- Silero VAD ONNX 模型（`models/silero_vad.onnx`）
-- 静态版 `ffmpeg.exe`（`bin/ffmpeg.exe`）
+Windows 安装包（`AutoSub-Setup-<version>-win64.exe`，约 **17 MB**）与绿色便携版（`AutoSub-<version>-win64-portable.zip`，约 **21 MB**）已内置全部运行依赖：
+- 独立 Python 运行时 + `PyYAML` + `certifi`（纯 Python HTTPS，无需 `curl`）
+- 单份 `onnxruntime.dll` C 库（通过纯 Python `ctypes` 直接调用 ONNX Runtime C API，彻底移除 `numpy` / `OpenBLAS`、重复 `.pyd` 和 PyTorch）
+- Silero VAD ONNX 模型（`models/silero_vad.onnx`，2.1 MB）
+- 音频精简静态版 `ffmpeg.exe`（`bin/ffmpeg.exe`，2.8 MB）
 - 可直接编辑的 `config/defaults.yaml`、`profiles/*.yaml` 与 `glossaries/*.yaml`
 
 安装后默认自动加入用户 `PATH`（无需管理员权限），打开任意 PowerShell / 终端即可直接运行：
@@ -44,7 +45,7 @@ autosub run P02_死灵龙.mp4 --profile twitch_dota2 --var hero="Visage / 死灵
 
 #### 如何构建 Windows 安装包
 
-- **云端自动打包（推荐，默认使用 ~4–6 MB 音频精简版 FFmpeg）**：将 `AutoSub` 推送到 GitHub 后，在 Actions 页面手动触发 `Build Windows Installer`（或推送 `v0.1.0` 标签自动发布 GitHub Release），CI 会先自动交叉编译仅含音频编解码的极简 `ffmpeg.exe`（体积从 106 MB 降至 ~4–6 MB），再生成 `AutoSub-Setup-<version>-win64.exe`（约 24 MB）与绿色版 `.zip`。
+- **云端自动打包（推荐，默认使用 2.8 MB 音频精简版 FFmpeg + 零 NumPy）**：将 `AutoSub` 推送到 GitHub 后，在 Actions 页面手动触发 `Build Windows Installer`（或推送 `v0.1.0` 标签自动发布 GitHub Release），CI 会先自动交叉编译仅含音频编解码的极简 `ffmpeg.exe`（体积从 106 MB 降至 ~2.8 MB），再生成 `AutoSub-Setup-<version>-win64.exe`（约 17 MB）与绿色版 `.zip`（约 21 MB）。
 - **在 Windows / WSL 本地一键打包**：安装 Python 3.10+ 与 [Inno Setup 6](https://jrsoftware.org/isinfo.php)（`winget install JRSoftware.InnoSetup`），在仓库根目录执行：
 
 ```powershell

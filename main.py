@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import shutil
 import sys
 from pathlib import Path
@@ -20,7 +19,7 @@ from src.config import (
 from src.profile import list_profiles
 from src.transcribe import run_transcript_cli, transcribe_media
 from src.translate import run_translate_cli, translate_srt
-from src.vad import find_silero_onnx_model
+from src.vad import probe_silero_vad_runtime
 
 
 def _configure_console_utf8() -> None:
@@ -185,10 +184,7 @@ def run_doctor(defaults_path: Path, *, strict_bundle: bool = False) -> int:
     ffmpeg_resolved = resolve_binary(str(tools_cfg.get("ffmpeg_bin") or ""), ["ffmpeg.exe", "ffmpeg"])
     ffmpeg_ok = Path(ffmpeg_resolved).is_file() or shutil.which(ffmpeg_resolved) is not None
 
-    onnx_path = find_silero_onnx_model()
-    has_ort = importlib.util.find_spec("onnxruntime") is not None
-    has_np = importlib.util.find_spec("numpy") is not None
-    silero_ok = onnx_path is not None and has_ort and has_np
+    silero_ok, silero_backend, onnx_path, ort_lib = probe_silero_vad_runtime()
 
     profiles = list_profiles()
     profiles_ok = len(profiles) > 0
@@ -202,7 +198,7 @@ def run_doctor(defaults_path: Path, *, strict_bundle: bool = False) -> int:
     print(f"FFmpeg: {'OK' if ffmpeg_ok else 'MISSING'} ({ffmpeg_resolved})", flush=True)
     print(
         f"Silero VAD (ONNX): {'OK' if silero_ok else '降级为 silencedetect'} "
-        f"(onnxruntime={has_ort}, numpy={has_np}, model={onnx_path or '未找到'})",
+        f"(backend={silero_backend}, runtime={ort_lib or 'n/a'}, model={onnx_path or '未找到'})",
         flush=True,
     )
     print(f"内置 Profile: {', '.join(n for n, _, _ in profiles) or '未找到'}", flush=True)

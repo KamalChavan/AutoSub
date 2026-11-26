@@ -64,10 +64,10 @@ try {
     }
     $VenvPy = Join-Path $VenvDir "Scripts\python.exe"
 
-    Write-Host "[2/6] Installing runtime + VAD (ONNX) + PyInstaller dependencies..."
+    Write-Host "[2/6] Installing runtime + VAD (ONNX C library only, zero NumPy/PyTorch) + PyInstaller..."
     Invoke-Checked $VenvPy @("-m", "pip", "install", "--upgrade", "pip") "upgrade pip"
-    Invoke-Checked $VenvPy @("-m", "pip", "install", "PyYAML>=6.0", "onnxruntime>=1.18", "numpy>=1.26", "certifi>=2024.0", "pyinstaller>=6.10") "install runtime deps"
-    Invoke-Checked $VenvPy @("-m", "pip", "install", "--no-deps", "silero-vad") "install silero-vad (--no-deps)"
+    Invoke-Checked $VenvPy @("-m", "pip", "install", "PyYAML>=6.0", "certifi>=2024.0", "pyinstaller>=6.10") "install runtime deps"
+    Invoke-Checked $VenvPy @("-m", "pip", "install", "--no-deps", "onnxruntime>=1.18", "silero-vad") "install onnxruntime & silero-vad (--no-deps)"
 
     # Run offline unit tests before packaging (strictly fail build if any test fails)
     Write-Host "[2.5/6] Running offline unit tests..."
