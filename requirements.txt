@@ -1,0 +1,4 @@
+PyYAML>=6.0
+# Optional for local Silero VAD (ONNX, no PyTorch required):
+#   pip install onnxruntime numpy
+#   pip install --no-deps silero-vad

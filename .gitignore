@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+*.srt
+*.ass
+*.vtt
+*.mp4
+*.mkv
+*.ts
+*.mp3
+*.wav
+*.f32
+logs/
+output/
+tmp/
+.pytest_cache/

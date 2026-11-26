@@ -1,0 +1,45 @@
+# AutoSub 全局默认引擎配置（与领域无关）
+# 特定任务的 Prompt、术语表、目标语言与上下文变量请配置在 profiles/*.yaml 中。
+
+api:
+  # Gemini API Key（留空则按优先级读取环境变量 GEMINI_API_KEY / GOOGLE_API_KEY 或 .env 文件）
+  api_key: ""
+  api_base: "https://generativelanguage.googleapis.com/v1beta"
+  # 可选代理地址（留空则继承系统 HTTP_PROXY / HTTPS_PROXY）
+  proxy: ""
+  timeout_seconds: 180
+
+tools:
+  # 留空则从系统 PATH 自动查找
+  ffmpeg_bin: ""
+
+transcript:
+  # 本地人声裁剪模式: silero_onnx（推荐，需 onnxruntime+numpy+silero-vad）| silencedetect（零依赖）| none
+  vad_mode: "silero_onnx"
+  vad_threshold: 0.35
+  vad_neg_threshold: 0.20
+  vad_speech_pad_ms: 500
+  vad_silence_gap_s: 0.50
+  # silencedetect 音量门限（仅 vad_mode=silencedetect 或 silero_onnx 不可用降级时生效）
+  silence_noise_db: -30
+  silence_min_duration_s: 1.5
+  # 单次转写分段上限（秒；词级时间戳硬上限 1800s，留余量 1680s = 28 分钟）
+  max_chunk_seconds: 1680
+  model: "gemini-3.5-transcribe"
+  max_retries: 6
+
+translate:
+  # 默认使用的 Profile（profiles/<name>.yaml 或任意外部 YAML 路径）
+  default_profile: "default"
+  # 均匀分批每批字幕条数上限（例如 532 条自动分为 [266, 266] 两批）
+  max_cues_per_batch: 280
+  # 遇到 503 高负载时，当前模型原地尝试次数，满次数后再切换下一级模型
+  retry_503: 3
+  # 模型降级链：RPD 耗尽 (429) 当轮直接跳过；503 重试满 3 次后切下一级
+  models:
+    - model: "gemini-4-hydrogen"
+      service_tier: "standard"
+    - model: "gemini-3.8-flash"
+      service_tier: "standard"
+    - model: "gemini-3.5-flash-lite"
+      service_tier: "standard"

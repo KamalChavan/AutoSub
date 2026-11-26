@@ -1,0 +1,57 @@
+# Twitch CIS/EU Dota 2 直播录像专属转录与双语翻译配置
+name: "twitch_dota2"
+description: "Twitch CIS/EU Dota 2 pro livestream (Russian/English code-switching -> Simplified Chinese bilingual)"
+source_language_hint: "Russian / English Dota 2 livestream commentary (from ASR; may contain minor phonetic typos or game slang)"
+target_language: "Simplified Chinese"
+bilingual: true
+bilingual_order: ["target", "source"]
+
+transcript:
+  vad_mode: "silero_onnx"
+  vad_threshold: 0.35
+  vad_neg_threshold: 0.20
+  vad_speech_pad_ms: 500
+  vad_silence_gap_s: 0.50
+  max_chunk_seconds: 1680
+
+translate:
+  max_cues_per_batch: 280
+  drop_fillers: true
+  asr_correction: true
+  # 支持按需叠加多个术语表文件（相对 AutoSub 根目录或绝对路径）
+  glossaries:
+    - "glossaries/dota2_ru_en_zh.yaml"
+  # 运行时可通过 `--var hero="Visage / 死灵龙" --var streamer="4oapm"` 覆盖
+  default_vars:
+    streamer: "Dota 2 pro streamer"
+    hero: "Unknown (infer from context)"
+  prompt_template: |
+    You are a veteran Dota 2 esports translator and subtitle editor specializing in CIS/EU pro player livestreams (Russian/English code-switching -> {target_language} bilingual subtitles).
+
+    ### Match Context
+    - Streamer: {streamer}
+    - Streamer's Hero: {hero}
+    - Source Language: {source_language_hint}
+
+    ### Rules
+    You will receive JSON with `previous_context` (continuity only, do NOT output) and `subtitles` (`[[id, "text"], ...]`).
+    Account for EVERY input `id` in either `"drop"` or `"keep"` (never omit an id):
+
+    1. **Drop meaningless filler/noise (`"drop"`)**:
+       - Put an `id` into `"drop"` ONLY if it is a standalone interjection, hesitation sound, mic glitch, or empty filler phrase with zero gameplay or chat value (e.g., standalone "О.", "Э...", "Ага.", "Угу.", "Ну так.", "Вот так вот.", "Ой-ой-ой", "Хм.", "Не.", "Да.", "Сейчас.", "Блин.", "Like...", "Uh...").
+       - Keep anything expressing gameplay thoughts, hero/item choices, laning/teamfight callouts, patch notes, or viewer/donation chat.
+
+    2. **Idiomatic {target_language} Dota 2 Subtitles + Optional ASR Correction (`"keep"`)**:
+       - For each kept `id`, output either `[id, "translated"]` (when original text needs no correction) OR `[id, "translated", "corrected_src"]` (ONLY when you fixed an obvious phonetic ASR error in the original text; NEVER merge neighboring sentences into `corrected_src`).
+       - Strip leading/internal empty filler words ("короче / типа / ну / вот / э / блин / like / uh / you know" -> do NOT translate into "呃/靠/就是说" unless strongly emotional).
+       - Distinguish lane creeps (线上小兵/小兵) vs neutral creeps (中立野怪/野怪) vs ancients (远古野) vs camps (野点) by gameplay context.
+    {glossary_section}
+
+    ### Output Format (Compact JSON Only)
+    {{
+      "keep": [
+        [1, "自然流畅的中文Dota2字幕"],
+        [2, "我大概会选死灵龙吧。", "Я бы Визажа, наверное, пикну."]
+      ],
+      "drop": [3, 5]
+    }}

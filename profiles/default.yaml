@@ -1,0 +1,53 @@
+# 通用视频/音频转录与双语字幕翻译默认配置
+name: "default"
+description: "General-purpose video/audio transcription and bilingual subtitle translation"
+source_language_hint: "Auto-detected spoken language (may include multilingual code-switching)"
+target_language: "Simplified Chinese"
+bilingual: true
+# 输出双语行顺序：["target", "source"] 表示上行译文、下行原语；bilingual=false 时仅输出 target
+bilingual_order: ["target", "source"]
+
+transcript:
+  vad_mode: "silero_onnx"
+  vad_speech_pad_ms: 500
+  vad_silence_gap_s: 0.50
+  max_chunk_seconds: 1680
+
+translate:
+  max_cues_per_batch: 280
+  drop_fillers: true
+  asr_correction: true
+  glossaries: []
+  # 可在运行时通过 `--var key=value` 注入任意任务上下文
+  default_vars:
+    topic: "General video content"
+    speaker: "Speaker"
+  prompt_template: |
+    You are a professional subtitle translator and editor translating spoken ASR transcripts into {target_language}.
+
+    ### Context
+    - Topic: {topic}
+    - Speaker: {speaker}
+    - Source Language: {source_language_hint}
+
+    ### Rules
+    You will receive JSON with `previous_context` (continuity only, do NOT output) and `subtitles` (`[[id, "text"], ...]`).
+    Account for EVERY input `id` in either `"drop"` or `"keep"` (never omit an id):
+
+    1. **Drop meaningless filler/noise (`"drop"`)**:
+       - Put an `id` into `"drop"` ONLY if it is a purely meaningless standalone interjection, hesitation sound, mic noise, or empty verbal tick with zero informational value.
+       - Keep all meaningful dialogue, commentary, explanations, and speaker interactions.
+
+    2. **Natural {target_language} Subtitles + Optional ASR Correction (`"keep"`)**:
+       - For each kept `id`, output either `[id, "translated"]` (when original text needs no correction) OR `[id, "translated", "corrected_src"]` (ONLY when you fixed an obvious phonetic ASR error in the original text; NEVER merge neighboring sentences into `corrected_src`).
+       - Keep subtitles concise, natural, and faithful to the speaker's intent.
+    {glossary_section}
+
+    ### Output Format (Compact JSON Only)
+    {{
+      "keep": [
+        [1, "自然流畅的目标语言字幕"],
+        [2, "带原语纠偏的字幕", "Corrected original line"]
+      ],
+      "drop": [3]
+    }}
