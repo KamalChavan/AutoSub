@@ -29,13 +29,19 @@ LAME_VERSION="${LAME_VERSION:-3.100}"
 HOST_TRIPLE="x86_64-w64-mingw32"
 JOBS="$(nproc 2>/dev/null || echo 4)"
 
-for tool in "${HOST_TRIPLE}-gcc" "${HOST_TRIPLE}-strip" nasm make curl tar; do
+for tool in "${HOST_TRIPLE}-gcc" "${HOST_TRIPLE}-strip" make curl tar; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "[ERROR] Missing required tool: $tool" >&2
     echo "Install on Ubuntu/WSL: sudo apt-get install -y gcc-mingw-w64-x86-64 nasm make pkg-config curl tar xz-utils" >&2
     exit 1
   fi
 done
+
+ASM_FLAG=""
+if ! command -v nasm >/dev/null 2>&1 && ! command -v yasm >/dev/null 2>&1; then
+  echo "[INFO] nasm/yasm not found; building with --disable-x86asm (still fast for audio-only workloads)"
+  ASM_FLAG="--disable-x86asm"
+fi
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/autosub_ffmpeg_min.XXXXXX")"
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -48,6 +54,7 @@ tar -xzf "${WORK_DIR}/lame.tar.gz" -C "$WORK_DIR"
 (
   cd "${WORK_DIR}/lame-${LAME_VERSION}"
   ./configure \
+    --build="$(uname -m)-pc-linux-gnu" \
     --host="${HOST_TRIPLE}" \
     --prefix="${PREFIX}" \
     --disable-shared \
@@ -55,6 +62,7 @@ tar -xzf "${WORK_DIR}/lame.tar.gz" -C "$WORK_DIR"
     --disable-frontend \
     --disable-gtktest \
     --disable-decoder \
+    cross_compiling=yes \
     CFLAGS="-O2"
   make -j"${JOBS}"
   make install
@@ -72,7 +80,8 @@ tar -xJf "${WORK_DIR}/ffmpeg.tar.xz" -C "$WORK_DIR"
     --pkg-config=pkg-config \
     --prefix="${PREFIX}" \
     --extra-cflags="-I${PREFIX}/include -Os" \
-    --extra-ldflags="-L${PREFIX}/lib -static -static-libgcc -static-libstdc++" \
+    --extra-ldflags="-L${PREFIX}/lib -static" \
+    ${ASM_FLAG} \
     --enable-static \
     --disable-shared \
     --disable-debug \
@@ -85,12 +94,12 @@ tar -xJf "${WORK_DIR}/ffmpeg.tar.xz" -C "$WORK_DIR"
     --enable-small \
     --enable-libmp3lame \
     --enable-protocol=file,pipe \
-    --enable-demuxer=mov,matroska,mpegts,mp3,wav,ogg,flac,aac,flv,asf,avi,aiff,m4v,f32le,s16le \
+    --enable-demuxer=mov,matroska,mpegts,mp3,wav,ogg,flac,aac,flv,asf,avi,aiff,pcm_f32le,pcm_s16le \
     --enable-parser=aac,aac_latm,mpegaudio,opus,vorbis,flac,ac3 \
     --enable-decoder=aac,aac_latm,mp3,mp3float,mp2,mp2float,opus,vorbis,flac,alac,ac3,eac3,wmav1,wmav2,wmapro,amrnb,amrwb,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s32le,pcm_f32le,pcm_f64le,pcm_u8,pcm_alaw,pcm_mulaw,adpcm_ima_wav,adpcm_ms \
     --enable-encoder=libmp3lame,aac,pcm_f32le,pcm_s16le \
-    --enable-muxer=mp3,adts,ipod,wav,f32le,null \
-    --enable-filter=aresample,aformat,anull,silencedetect,volume
+    --enable-muxer=mp3,adts,ipod,wav,pcm_f32le,pcm_s16le,null \
+    --enable-filter=aresample,aformat,anull,silencedetect,volume,abuffer,abuffersink
   make -j"${JOBS}" ffmpeg.exe
   "${HOST_TRIPLE}-strip" --strip-all ffmpeg.exe
   cp ffmpeg.exe "${OUT_PATH}"
