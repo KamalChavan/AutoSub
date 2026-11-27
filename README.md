@@ -127,15 +127,25 @@ autosub transcript "P02_死灵龙.mp4" \
   --model elevenlabs/scribe_v3 \
   --lang rus --secondary-lang eng --no-verbatim --numbers-format digits
 
-# 单独使用 OpenAI gpt-6.2-sol 翻译已有 SRT
+# 单独使用 OpenAI gpt-6.2-sol 翻译已有 SRT（开启 Pass 0 全片上下文分析 + 碎句语义合并 + CPS 排轴优化）
 autosub translate "P02_死灵龙.srt" \
   --profile twitch_dota2 \
   --model openai/gpt-6.2-sol \
   --reasoning-effort medium \
-  --var hero="死灵龙" --var streamer="4oapm"
+  --auto-context
+
+# 高阶：双 ASR 交叉仲裁（以 ElevenLabs 为主轨时间轴 + Gemini 原语字幕为参考轨纠偏）
+autosub translate "elevenlabs.srt" \
+  --ref-srt "gemini_35_transcribe.srt" \
+  --profile twitch_dota2 \
+  --model openai/gpt-6.2-sol \
+  --reasoning-effort medium \
+  --auto-context
 ```
 
-> 提示：ElevenLabs `keyterms`（`--keyterm`）会增加 `+25%` 计费，默认关闭，仅在人名/专业词识别困难时按需传入。
+> 提示：
+> - ElevenLabs `keyterms`（`--keyterm`）会增加 `+25%` 计费，默认关闭，仅在人名/专业词识别困难时按需传入。
+> - 翻译阶段默认开启**相邻碎句语义合并**（可 `--no-merge-cues` 关闭）与 **CPS 读速/最短驻留排轴后处理**（可 `--no-polish-timing` 关闭）。
 
 ### 4. Twitch Dota 2 直播录像（默认 Gemini）
 

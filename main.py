@@ -133,6 +133,26 @@ def _add_translate_args(p: argparse.ArgumentParser) -> None:
         default=None,
         help="覆盖每批翻译条数上限（默认 280，自动均匀切分）",
     )
+    p.add_argument(
+        "--auto-context",
+        action="store_true",
+        default=None,
+        help="开启 Pass 0 全片上下文自动分析（提前提取英雄/人名/高频 ASR 错词并缓存复用于所有批次）",
+    )
+    p.add_argument(
+        "--no-merge-cues",
+        dest="merge_cues",
+        action="store_false",
+        default=None,
+        help="关闭相邻短间隔碎句语义合并（默认开启）",
+    )
+    p.add_argument(
+        "--no-polish-timing",
+        dest="polish_timing",
+        action="store_false",
+        default=None,
+        help="关闭翻译后 CPS 读速/最短驻留时间轴打磨（默认开启）",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -195,6 +215,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         default=None,
         help="覆盖翻译模型或逗号分隔降级链（如 openai/gpt-6.2-sol,gemini/gemini-4-hydrogen）",
+    )
+    tl_parser.add_argument(
+        "--ref-srt",
+        default=None,
+        metavar="PATH",
+        help="可选：第二份独立 ASR 原语 .srt 参考轨（用于双 ASR 交叉纠偏，例如 ElevenLabs 主轨 + Gemini 参考轨）",
     )
     _add_translate_args(tl_parser)
     tl_parser.add_argument("-o", "--output", default=None, help="输出翻译后 .srt 路径")
@@ -395,6 +421,10 @@ def main(argv: list[str] | None = None) -> int:
             provider_override=args.provider,
             model_override=args.model,
             reasoning_effort_override=args.reasoning_effort,
+            auto_context_override=args.auto_context,
+            merge_cues_override=args.merge_cues,
+            polish_timing_override=args.polish_timing,
+            ref_srt_path=Path(args.ref_srt).resolve() if args.ref_srt else None,
             output_path=Path(args.output).resolve() if args.output else None,
         )
 
@@ -430,6 +460,9 @@ def main(argv: list[str] | None = None) -> int:
                 provider_override=args.translate_provider,
                 model_override=args.translate_model,
                 reasoning_effort_override=args.reasoning_effort,
+                auto_context_override=args.auto_context,
+                merge_cues_override=args.merge_cues,
+                polish_timing_override=args.polish_timing,
                 output_path=Path(args.output).resolve() if args.output else None,
             )
             return 0

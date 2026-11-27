@@ -59,12 +59,15 @@ from src.providers.openai import (
 from src.providers.openai_compat import OpenAICompatTranslateProvider
 from src.srt import (
     SrtCue,
+    align_reference_srt,
     append_srt_cues,
+    clamp_stretched_words,
     format_srt_ts,
     group_words_to_cues,
     map_word_to_original,
     parse_srt,
     parse_srt_ts,
+    polish_srt_timing,
     write_srt,
 )
 from src.transcribe import call_gemini_transcribe, extract_words_from_interaction, map_transcribed_words_to_original
@@ -72,6 +75,7 @@ from src.translate import (
     DEFAULT_TRANSLATE_MODELS,
     SubtitleTranslator,
     _parse_compact_translation,
+    _parse_cue_entries,
     _resolve_translate_models_and_providers,
     format_cue_lines,
     normalize_translate_chain,
@@ -1004,6 +1008,197 @@ class TestMultiProviderArchitecture(unittest.TestCase):
         self.assertIn("elevenlabs", out_txt)
         self.assertIn("openai", out_txt)
         self.assertIn("openai_compatible", out_txt)
+
+
+class TestPhaseOneQualityUpgrades(unittest.TestCase):
+    def test_clamp_stretched_words_and_orphan_tail_absorption(self) -> None:
+        # 1. Trailing-silence stretch (like Gemini 14.48s single word) clamped anchored at start
+        words = [
+            {"seg": 0, "start": 10.0, "end": 24.48, "text": "Седьмая.", "space_before": True},
+            {"seg": 1, "start": 30.0, "end": 34.36, "text": "Очень", "space_before": True},
+            {"seg": 1, "start": 34.40, "end": 34.90, "text": "плохо.", "space_before": True},
+        ]
+        clamped = clamp_stretched_words(words)
+        self.assertAlmostEqual(clamped[0]["start"], 10.0, places=2)
+        self.assertAlmostEqual(clamped[0]["end"], 11.86, places=2)  # max(1.8, 0.12*8 + 0.9) = 1.86
+        # Anchored to next word -> start trimmed instead of end
+        self.assertAlmostEqual(clamped[1]["end"], 34.36, places=2)
+        self.assertAlmostEqual(clamped[1]["start"], 32.56, places=2)
+
+        # 2. Comma at >=48 chars followed by 1-word orphan tail (`мне.`) absorbed instead of split
+        orphan_words = [
+            {"seg": 0, "start": 0.0, "end": 0.4, "text": "Кам,", "space_before": True},
+            {"seg": 0, "start": 0.45, "end": 0.8, "text": "кам,", "space_before": True},
+            {"seg": 0, "start": 0.85, "end": 1.3, "text": "ребята,", "space_before": True},
+            {"seg": 0, "start": 1.35, "end": 1.8, "text": "пурдж", "space_before": True},
+            {"seg": 0, "start": 1.85, "end": 2.2, "text": "крипа", "space_before": True},
+            {"seg": 0, "start": 2.25, "end": 2.7, "text": "приведите,", "space_before": True},
+            {"seg": 0, "start": 2.75, "end": 3.2, "text": "пожалуйста,", "space_before": True},
+            {"seg": 0, "start": 3.26, "end": 3.48, "text": "мне.", "space_before": True},
+        ]
+        cues = group_words_to_cues(orphan_words)
+        self.assertEqual(len(cues), 1)
+        self.assertTrue(cues[0].text.endswith("пожалуйста, мне."))
+
+    def test_polish_srt_timing_linger_bridge_and_no_overlap(self) -> None:
+        raw = [
+            (1.00, 1.45, ["为什么要这么打呢？", "Why should we do that?"]),  # 0.45s, 9 zh chars -> needs linger
+            (5.00, 5.50, ["快退。", "Back."]),
+            (5.60, 6.20, ["小心雾。", "Careful smoke."]),  # 0.10s gap -> bridged seamlessly after linger
+        ]
+        polished = polish_srt_timing(raw, min_duration=1.0, max_cps=13.0, max_linger=1.2, bridge_gap=0.15, lead_in=0.05)
+        self.assertEqual(len(polished), 3)
+        # Cue 1 gets lead-in (0.95) and lingers >= 1.0s
+        self.assertAlmostEqual(polished[0][0], 0.95, places=3)
+        self.assertGreaterEqual(polished[0][1] - polished[0][0], 1.0)
+        # Cue 2 cannot overlap Cue 3; micro-gap bridged cleanly
+        self.assertLessEqual(polished[1][1], polished[2][0])
+        self.assertAlmostEqual(polished[1][1], polished[2][0], places=3)
+        # Cue 3 extended into trailing silence
+        self.assertGreaterEqual(polished[2][1] - polished[2][0], 1.0)
+
+    def test_align_reference_srt_dual_asr_matching(self) -> None:
+        primary = [
+            SrtCue(1, 10.0, 11.2, "А, вы снова когда угораете?"),
+            SrtCue(2, 20.0, 21.0, "Привет!"),
+            SrtCue(3, 30.0, 31.5, "Guys, just chill."),
+        ]
+        ref = [
+            SrtCue(1, 9.9, 11.3, "А, вы с моего КД угораете?"),
+            SrtCue(2, 20.0, 21.0, "привет"),
+        ]
+        aligned = align_reference_srt(primary, ref)
+        self.assertEqual(aligned, {1: "А, вы с моего КД угораете?"})
+
+    def test_semantic_cue_merge_and_guardrails(self) -> None:
+        batch = [
+            SrtCue(1, 1.0, 1.4, "Дабл"),
+            SrtCue(2, 2.2, 3.0, "ю, дабл ю, братан!"),
+            SrtCue(3, 10.0, 11.0, "Far apart A"),
+            SrtCue(4, 16.0, 17.0, "Far apart B"),
+            SrtCue(5, 20.0, 20.5, "Опа!"),
+        ]
+        parsed = {
+            "keep": [
+                [[1, 2], "W！W！兄弟！", "Дабл ю, дабл ю, братан!"],
+                # Illegal merge across 5s silence gap -> must be rejected by guardrail
+                [[3, 4], "Should be rejected"],
+            ],
+            "drop": [5],
+        }
+        entries, kept, dropped, merged = _parse_cue_entries(
+            parsed, batch, allow_merge=True, max_merge_gap=1.8, max_merge_duration=6.5,
+        )
+        self.assertEqual(merged, 1)
+        self.assertEqual(dropped, 1)
+        self.assertEqual(kept, 4)
+        # Entry 0: merged [1, 2] spans [1.0, 3.0]
+        self.assertEqual(entries[0]["ids"], [1, 2])
+        self.assertAlmostEqual(entries[0]["start"], 1.0)
+        self.assertAlmostEqual(entries[0]["end"], 3.0)
+        self.assertEqual(entries[0]["target"], "W！W！兄弟！")
+        # Rejected merge [3, 4] safely preserves cues 3 & 4 individually
+        self.assertEqual([e["ids"] for e in entries[1:]], [[3], [4]])
+        self.assertEqual(entries[1]["target"], "Far apart A")
+        self.assertEqual(entries[2]["target"], "Far apart B")
+
+    def test_pass0_auto_context_dual_asr_merge_and_timing_polish_end_to_end(self) -> None:
+        calls: list[dict] = []
+
+        def fake_post(url: str, payload: dict, **_kw) -> dict:
+            calls.append(payload)
+            if len(calls) == 1:
+                # Pass 0 response
+                ctx_obj = {
+                    "summary": "Dota 2 Huskar mid match vs Monkey King.",
+                    "speakers_and_names": ["4oapm (streamer)", "Lavrik (teammate)"],
+                    "key_entities": ["Huskar", "Monkey King"],
+                    "asr_error_map": [["снова когда", "с моего КДА (KDA)"]],
+                }
+                return {
+                    "output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps(ctx_obj, ensure_ascii=False)}]}],
+                    "usage": {"input_tokens": 120, "output_tokens": 50},
+                }
+            # Pass 1 translation response with merge + ASR correction
+            tl_obj = {
+                "keep": [
+                    [[1, 2], "第一把热热手，不行下一把。", "Ну, первая раскликачная, некст пойдем."],
+                    [3, "哦，你们是在笑我的KDA啊？", "А, вы с моего КДА угораете?"],
+                ],
+                "drop": [],
+            }
+            return {
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": json.dumps(tl_obj, ensure_ascii=False)}]}],
+                "usage": {"input_tokens": 400, "output_tokens": 70, "input_tokens_details": {"cached_tokens": 280}},
+            }
+
+        pmap = {
+            "openai": ProviderSettings(
+                name="openai", protocol="openai", api_key="sk", api_base="https://api.openai.com/v1", api_mode="responses"
+            )
+        }
+        tr = SubtitleTranslator(
+            models=[{"provider": "openai", "model": "gpt-6.2-sol", "reasoning_effort": "low"}],
+            providers_map=pmap,
+            post_fn=fake_post,
+            sleep_fn=lambda _: None,
+        )
+        cues = [
+            SrtCue(1, 1.0, 2.0, "Ну, первая раскликачная,"),
+            SrtCue(2, 2.06, 2.40, "некст пойдем."),
+            SrtCue(3, 10.0, 10.45, "А, вы снова когда угораете?"),
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            out_path = Path(td) / "polished.srt"
+            out = tr.translate_cues(
+                cues,
+                system_prompt="BASE_SYS",
+                allow_merge=True,
+                ref_asr_map={3: "А, вы с моего КД угораете?"},
+                polish_timing=True,
+                auto_context=True,
+                output_path=out_path,
+            )
+            self.assertEqual(len(calls), 2)
+            # Pass 1 system prompt includes Pass 0 context, merge rule, and dual-ASR rule
+            p1_dev = calls[1]["input"][0]["content"]
+            self.assertIn("Auto-Extracted Full-Video Context (Pass 0)", p1_dev)
+            self.assertIn("Lavrik (teammate)", p1_dev)
+            self.assertIn("Semantic Fragment Merging", p1_dev)
+            self.assertIn("Dual-ASR Reference Disambiguation", p1_dev)
+            # Pass 1 user payload includes mergeable_pairs and alt_asr while keeping subtitles 2-tuples
+            p1_user = json.loads(calls[1]["input"][1]["content"])
+            self.assertEqual(p1_user["mergeable_pairs"], [[1, 2]])
+            self.assertEqual(p1_user["alt_asr"], {"3": "А, вы с моего КД угораете?"})
+            # Output has 2 merged/polished cues; cue 2 extended from 0.45s to >= 1.0s
+            self.assertEqual(len(out), 2)
+            self.assertGreaterEqual(out[1][1] - out[1][0], 1.0)
+            disk_cues = parse_srt(out_path)
+            self.assertEqual(len(disk_cues), 2)
+            self.assertIn("KDA", disk_cues[1].text)
+
+    def test_phase1_cli_flags_and_dota_announcer_drop_rule(self) -> None:
+        parser = autosub_main.build_parser()
+        a_tl = parser.parse_args([
+            "translate", "el.srt",
+            "--ref-srt", "gem.srt",
+            "--auto-context",
+            "--no-merge-cues",
+            "--no-polish-timing",
+        ])
+        self.assertEqual(a_tl.ref_srt, "gem.srt")
+        self.assertIs(a_tl.auto_context, True)
+        self.assertIs(a_tl.merge_cues, False)
+        self.assertIs(a_tl.polish_timing, False)
+
+        a_run = parser.parse_args(["run", "vod.mp4", "--auto-context", "--no-merge-cues", "--no-polish-timing"])
+        self.assertIs(a_run.auto_context, True)
+        self.assertIs(a_run.merge_cues, False)
+        self.assertIs(a_run.polish_timing, False)
+
+        dota = load_profile("twitch_dota2")
+        self.assertIn("in-game announcer", dota.prompt_template)
+        self.assertIn("Prepare for battle.", dota.prompt_template)
 
 
 if __name__ == "__main__":

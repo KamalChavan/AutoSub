@@ -85,6 +85,14 @@ translate:
   max_cues_per_batch: 280
   # 遇到 503 高负载时，当前模型原地尝试次数，满次数后再切换下一级模型
   retry_503: 3
+  # 语义级碎句合并（允许模型把短停顿劈开的残尾孤儿词合并，时间戳严格锚定原词起止边界）
+  merge_cues: true
+  max_merge_gap_s: 1.8
+  max_merge_duration_s: 6.5
+  # 确定性字幕排轴后处理（最短驻留、CPS 读速延展、微间隙桥接，零 API 成本）
+  polish_timing: true
+  # Pass 0 全片上下文自动提取（需额外 1 次调用，建议搭配 OpenAI gpt-6.2-sol 或通过 --auto-context 开启）
+  auto_context: false
   # 跨厂商模型降级链：RPD/额度耗尽 (429/402) 当轮直接跳过；503 重试满 3 次后切下一级
   # 支持按条目指定 provider（例如启用 OpenAI gpt-6.2-sol 作为主力，Gemini 兜底）：
   #   - provider: "openai"

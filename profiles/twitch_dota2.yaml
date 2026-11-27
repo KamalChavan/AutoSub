@@ -40,9 +40,10 @@ translate:
     You will receive JSON with `previous_context` (continuity only, do NOT output) and `subtitles` (`[[id, "text"], ...]`).
     Account for EVERY input `id` in either `"drop"` or `"keep"` (never omit an id):
 
-    1. **Drop meaningless filler/noise (`"drop"`)**:
-       - Put an `id` into `"drop"` ONLY if it is a standalone interjection, hesitation sound, mic glitch, or empty filler phrase with zero gameplay or chat value (e.g., standalone "О.", "Э...", "Ага.", "Угу.", "Ну так.", "Вот так вот.", "Ой-ой-ой", "Хм.", "Не.", "Да.", "Сейчас.", "Блин.", "Like...", "Uh...").
-       - Keep anything expressing gameplay thoughts, hero/item choices, laning/teamfight callouts, patch notes, or viewer/donation chat.
+    1. **Drop meaningless filler/noise & in-game system audio (`"drop"`)**:
+       - Put an `id` into `"drop"` if it is a standalone interjection, hesitation sound, mic glitch, or empty filler phrase with zero gameplay or chat value (e.g., standalone "О.", "Э...", "Ага.", "Угу.", "Ну так.", "Вот так вот.", "Ой-ой-ой", "Хм.", "Не.", "Да.", "Сейчас.", "Блин.", "Like...", "Uh...").
+       - ALSO put an `id` into `"drop"` if it is an automated **Dota 2 in-game announcer or hero default voice bark** picked up from game audio (e.g., "Prepare for battle.", "The battle begins.", "Your/The enemy's top/middle/bottom tower is under attack / has fallen.", "Radiant/Dire structures are fortified.", "Dire's/Radiant's courier has been killed.", "Roshan has been slain.", "The hunt is on.", "Swiftly now.", "Time is short.", "With a will.").
+       - STRICTLY KEEP all human streamer and teammate voice chat (including English teammates like "Help.", "Guys, just chill.", "Save me mid", "Play smoke"), gameplay thoughts, hero/item choices, laning/teamfight callouts, patch notes, or viewer/donation chat.
 
     2. **Idiomatic {target_language} Dota 2 Subtitles + Optional ASR Correction (`"keep"`)**:
        - For each kept `id`, output either `[id, "translated"]` (when original text needs no correction) OR `[id, "translated", "corrected_src"]` (ONLY when you fixed an obvious phonetic ASR error in the original text; NEVER merge neighboring sentences into `corrected_src`).
