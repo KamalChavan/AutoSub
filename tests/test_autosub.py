@@ -62,18 +62,29 @@ from src.providers.openai import (
     extract_whisper_verbose_words,
 )
 from src.providers.openai_compat import OpenAICompatTranslateProvider
+from src.resegment import (
+    format_block_words_for_llm,
+    partition_words_into_blocks,
+    resegment_file,
+    resegment_words_with_llm,
+)
 from src.srt import (
     SrtCue,
     _effective_display_chars,
     align_reference_srt,
     append_srt_cues,
     clamp_stretched_words,
+    default_words_json_path,
+    find_sidecar_words_json,
     format_srt_ts,
     group_words_to_cues,
+    load_words_json,
     map_word_to_original,
     parse_srt,
     parse_srt_ts,
     polish_srt_timing,
+    reconstruct_cues_from_word_spans,
+    save_words_json,
     wrap_subtitle_line,
     write_srt,
 )
@@ -96,6 +107,7 @@ from src.translate import (
     normalize_translate_model_specs,
     split_cues_by_gaps,
     split_cues_evenly,
+    translate_srt,
 )
 from src.vad import (
     find_onnxruntime_library,
@@ -1817,6 +1829,305 @@ class TestReliabilityCacheAndWrapping(unittest.TestCase):
         self.assertFalse(get_logging_config(defaults)["llm_requests"])
         self.assertTrue(defaults["translate"]["repair_missing"])
         self.assertEqual(defaults["translate"]["max_line_chars"], 24)
+
+
+class TestWordLevelResegmentation(unittest.TestCase):
+    def test_words_json_save_load_sidecar_and_span_reconstruction(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            srt_path = d / "vod.srt"
+            srt_path.write_text("1\n00:00:01,000 --> 00:00:02,000\nhello\n\n", encoding="utf-8")
+            self.assertIsNone(find_sidecar_words_json(srt_path))
+
+            raw_words = [
+                {"seg": 0, "start": 1.0, "end": 1.4, "text": "Hello", "space_before": True, "speaker": "spk_0"},
+                {"seg": 0, "start": 1.45, "end": 1.9, "text": "world!", "space_before": True, "speaker": "spk_0"},
+                {"seg": 1, "start": 5.0, "end": 5.3, "text": "你好", "space_before": False},
+                {"seg": 1, "start": 5.32, "end": 5.7, "text": "世界。", "space_before": False},
+            ]
+            w_path = default_words_json_path(srt_path)
+            save_words_json(raw_words, w_path, provider="elevenlabs", model="scribe_v3", source_media="vod.mp4")
+            self.assertEqual(find_sidecar_words_json(srt_path), w_path)
+
+            loaded = load_words_json(w_path)
+            self.assertEqual(len(loaded), 4)
+            self.assertEqual([w["id"] for w in loaded], [1, 2, 3, 4])
+            self.assertEqual(loaded[0]["speaker"], "spk_0")
+            self.assertFalse(loaded[3]["space_before"])
+
+            cues = reconstruct_cues_from_word_spans(loaded, [(1, 2), (3, 4)])
+            self.assertEqual(len(cues), 2)
+            self.assertEqual((cues[0].start, cues[0].end, cues[0].text), (1.0, 1.9, "Hello world!"))
+            self.assertEqual((cues[1].start, cues[1].end, cues[1].text), (5.0, 5.7, "你好世界。"))
+
+            # transcribe_media_pair persists .words.json by default and respects save_words_json_override=False
+            cfg_path = d / "defaults.yaml"
+            cfg_path.write_text(
+                yaml.safe_dump({
+                    "providers": {"elevenlabs": {"api_key": "el-k"}},
+                    "cache": {"enabled": True, "path": str(d / "cache.db")},
+                    "transcript": {"vad_mode": "none", "provider": "elevenlabs", "model": "scribe_v3"},
+                }),
+                encoding="utf-8",
+            )
+            media = d / "sample.wav"
+            media.write_bytes(b"RIFF")
+            el_resp = {
+                "language_code": "rus",
+                "words": [
+                    {"text": "Привет,", "start": 0.1, "end": 0.4, "type": "word"},
+                    {"text": " ", "start": 0.4, "end": 0.45, "type": "spacing"},
+                    {"text": "мир!", "start": 0.45, "end": 0.8, "type": "word"},
+                ],
+            }
+            with (
+                mock.patch("src.transcribe.subprocess.run", side_effect=lambda cmd, **kw: Path(cmd[-1]).write_bytes(b"\x00" * 64000)),
+                mock.patch("src.transcribe.render_chunk_mp3", side_effect=lambda pcm, cm, out_p, **kw: out_p.write_bytes(b"MP3")),
+                mock.patch("src.providers.elevenlabs.post_multipart", return_value=el_resp),
+            ):
+                out1 = d / "t1.srt"
+                transcribe_media_pair(media, defaults_path=cfg_path, output_path=out1)
+                self.assertTrue((d / "t1.words.json").is_file())
+                self.assertEqual(len(load_words_json(d / "t1.words.json")), 2)
+
+                out2 = d / "t2.srt"
+                transcribe_media_pair(media, defaults_path=cfg_path, output_path=out2, save_words_json_override=False)
+                self.assertFalse((d / "t2.words.json").exists())
+
+    def test_partition_words_into_blocks_hard_gaps_speakers_and_oversized(self) -> None:
+        words = [
+            # Short atomic block (needs_llm=False)
+            {"seg": 0, "start": 0.0, "end": 0.4, "text": "Привет!", "space_before": True, "speaker": "A"},
+            # Hard gap (2.0s) -> Block 2: multi-sentence run-on (needs_llm=True)
+            {"seg": 1, "start": 2.4, "end": 2.7, "text": "Alone.", "space_before": True, "speaker": "A"},
+            {"seg": 1, "start": 2.9, "end": 3.2, "text": "Тема", "space_before": True, "speaker": "A"},
+            {"seg": 1, "start": 3.3, "end": 3.6, "text": "стоит", "space_before": True, "speaker": "A"},
+            {"seg": 1, "start": 3.7, "end": 4.0, "text": "пять", "space_before": True, "speaker": "A"},
+            {"seg": 1, "start": 4.1, "end": 4.4, "text": "минут.", "space_before": True, "speaker": "A"},
+            # Speaker switch (0.1s gap, different speaker B) -> Block 3
+            {"seg": 1, "start": 4.5, "end": 4.9, "text": "Nice!", "space_before": True, "speaker": "B"},
+        ]
+        norm, blocks = partition_words_into_blocks(words, hard_gap_s=1.2)
+        self.assertEqual(len(norm), 7)
+        self.assertEqual(len(blocks), 3)
+        self.assertFalse(blocks[0].needs_llm)
+        self.assertTrue(blocks[1].needs_llm)
+        self.assertFalse(blocks[2].needs_llm)
+
+        formatted = format_block_words_for_llm(blocks[1].words, pause_hint_s=0.15)
+        self.assertIn("2:Alone. (0.2s) 3:Тема", formatted)
+
+        # Oversized continuous speech stream splits cleanly at largest internal pause
+        long_stream = []
+        t = 0.0
+        for i in range(1, 25):
+            long_stream.append({"seg": 0, "start": t, "end": t + 0.3, "text": f"w{i}", "space_before": True})
+            t += 1.0 if i == 11 else 0.35  # 0.7s gap after w11 (< hard_gap_s 1.2s)
+        _n, long_blocks = partition_words_into_blocks(long_stream, hard_gap_s=1.2, max_block_words=15)
+        self.assertEqual(len(long_blocks), 2)
+        self.assertEqual(long_blocks[0].last_wid, 11)
+        self.assertEqual(long_blocks[1].first_wid, 12)
+
+    def test_resegment_words_with_llm_splits_repairs_caches_and_fallbacks(self) -> None:
+        # Block 1: short atomic ("Опа!") -> skipped by LLM (zero cost)
+        # Block 2: 2-clause sentence needing clean split
+        # Block 3: very long block left unsplit on turn 1 -> repaired on turn 2!
+        words = [
+            {"seg": 0, "start": 0.0, "end": 0.4, "text": "Опа!", "space_before": True},
+            # Block 2 (gap 2.0s)
+            {"seg": 1, "start": 2.4, "end": 2.7, "text": "Alone.", "space_before": True},
+            {"seg": 1, "start": 2.9, "end": 3.2, "text": "Тема", "space_before": True},
+            {"seg": 1, "start": 3.3, "end": 3.6, "text": "в", "space_before": True},
+            {"seg": 1, "start": 3.7, "end": 4.0, "text": "официалке", "space_before": True},
+            {"seg": 1, "start": 4.1, "end": 4.5, "text": "стоит.", "space_before": True},
+        ]
+        # Block 3 (gap 2.0s): 16 words (~112 chars -> violates hard_max_chars if left unsplit)
+        t = 6.5
+        for k in range(16):
+            words.append({
+                "seg": 2,
+                "start": t,
+                "end": t + 0.35,
+                "text": f"слово{k:02d}," if k == 7 else f"слово{k:02d}",
+                "space_before": True,
+            })
+            t += 0.40
+
+        with tempfile.TemporaryDirectory() as td:
+            cache = ResultCache(Path(td) / "reseg_cache.db")
+            captured: list[tuple[str, dict]] = []
+
+            def fake_post(url, payload, **_kw):
+                sys_txt = payload["system_instruction"]["parts"][0]["text"]
+                usr_obj = json.loads(payload["contents"][0]["parts"][0]["text"])
+                captured.append((sys_txt, usr_obj))
+                if len(captured) == 1:
+                    # Turn 1: splits block 2 nicely ([2, 6]), leaves block 3 unsplit ([22]) -> triggers repair!
+                    return _mk_resp({"splits": {"2": [2, 6], "3": [22]}})
+                # Turn 2 (repair): receives ONLY block 3 with diagnostic and splits at 14, 22
+                return _mk_resp({"splits": {"3": [14, 22]}})
+
+            tr = SubtitleTranslator(
+                api_key="k",
+                models=[{"provider": "gemini", "model": "gemini-4-hydrogen"}],
+                post_fn=fake_post,
+                sleep_fn=lambda _: None,
+                cache=cache,
+            )
+            cues, info = resegment_words_with_llm(words, translator=tr, max_cue_chars=28.0)
+            self.assertEqual(len(captured), 2)
+            # Identical system prompt reused for Prompt Caching on repair turn
+            self.assertEqual(captured[0][0], captured[1][0])
+            # Block 1 ("Опа!") was NOT sent to LLM
+            sent_block_ids = [b["block_id"] for b in captured[0][1]["blocks"]]
+            self.assertEqual(sent_block_ids, [2, 3])
+            # Repair sent ONLY block 3
+            self.assertEqual([b["block_id"] for b in captured[1][1]["blocks"]], [3])
+            self.assertEqual(info["repaired_blocks"], 1)
+            # Resulting cues: 1 ("Опа!") + 2 ("Alone.", "Тема в официалке стоит.") + 2 (block 3 halves) = 5
+            self.assertEqual(len(cues), 5)
+            self.assertEqual(cues[0].text, "Опа!")
+            self.assertEqual((cues[1].start, cues[1].end, cues[1].text), (2.4, 2.7, "Alone."))
+            self.assertEqual((cues[2].start, cues[2].end, cues[2].text), (2.9, 4.5, "Тема в официалке стоит."))
+
+            # Second run hits SQLite `resegment` cache with 0 additional API calls
+            tr2 = SubtitleTranslator(
+                api_key="k",
+                models=[{"provider": "gemini", "model": "gemini-4-hydrogen"}],
+                post_fn=fake_post,
+                sleep_fn=lambda _: None,
+                cache=cache,
+            )
+            cues2, info2 = resegment_words_with_llm(words, translator=tr2, max_cue_chars=28.0)
+            self.assertEqual(len(captured), 2)  # zero new calls
+            self.assertEqual(info2["cache_hits"], 1)
+            self.assertEqual([c.text for c in cues2], [c.text for c in cues])
+
+            # Total API outage gracefully falls back to deterministic rule splitting preserving all words
+            def always_fail(*_a, **_kw):
+                raise ProviderApiError("503", "down", http_status=503, provider="Gemini")
+
+            tr_fail = SubtitleTranslator(
+                api_key="k",
+                models=[{"provider": "gemini", "model": "gemini-4-hydrogen"}],
+                retry_503=1,
+                post_fn=always_fail,
+                sleep_fn=lambda _: None,
+            )
+            fb_cues, fb_info = resegment_words_with_llm(words, translator=tr_fail, max_cue_chars=28.0)
+            self.assertGreaterEqual(len(fb_cues), 3)
+            self.assertEqual(fb_info["rule_fallback_blocks"], 2)
+            self.assertEqual(" ".join(c.text for c in fb_cues).split(), [w["text"] for w in words])
+
+    def test_translate_srt_auto_discovers_words_json_and_resegments_before_translation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            cfg_path = d / "defaults.yaml"
+            cfg_path.write_text(
+                yaml.safe_dump({
+                    "providers": {"gemini": {"api_key": "gm-k"}},
+                    "cache": {"enabled": True, "path": str(d / "cache.db")},
+                    "translate": {
+                        "models": [{"provider": "gemini", "model": "gemini-4-hydrogen"}],
+                        "resegment": True,
+                        "polish_timing": False,
+                        "merge_cues": False,
+                    },
+                }),
+                encoding="utf-8",
+            )
+            # Raw SRT has 1 packed cue; sidecar .words.json has exact words allowing clean 2-cue split
+            srt_in = d / "demo.srt"
+            srt_in.write_text("1\n00:00:01,000 --> 00:00:04,500\nAlone. Tema stands mid.\n\n", encoding="utf-8")
+            save_words_json(
+                [
+                    {"seg": 0, "start": 1.0, "end": 1.4, "text": "Alone.", "space_before": True},
+                    {"seg": 0, "start": 1.9, "end": 2.3, "text": "Tema", "space_before": True},
+                    {"seg": 0, "start": 2.4, "end": 3.2, "text": "stands", "space_before": True},
+                    {"seg": 0, "start": 3.3, "end": 4.5, "text": "mid.", "space_before": True},
+                ],
+                d / "demo.words.json",
+            )
+            calls: list[str] = []
+
+            def fake_post(url, payload, **_kw):
+                sys_txt = payload["system_instruction"]["parts"][0]["text"]
+                if "segmentation editor" in sys_txt:
+                    calls.append("resegment")
+                    return _mk_resp({"splits": {"1": [1, 4]}})
+                calls.append("translate")
+                usr = json.loads(payload["contents"][0]["parts"][0]["text"])
+                subs = usr["subtitles"]
+                return _mk_resp({"keep": [[row[0], f"译:{row[1]}"] for row in subs], "drop": []})
+
+            with mock.patch("src.translate.post_json", side_effect=fake_post):
+                out_reseg = translate_srt(srt_in, defaults_path=cfg_path, output_path=d / "out_reseg.srt")
+                cues_reseg = parse_srt(out_reseg)
+                self.assertEqual(calls, ["resegment", "translate"])
+                self.assertEqual(len(cues_reseg), 2)
+                self.assertAlmostEqual(cues_reseg[0].end, 1.4, places=2)
+                self.assertAlmostEqual(cues_reseg[1].start, 1.9, places=2)
+
+                # With resegment_override=False, skips re-segmentation and translates raw 1-cue SRT directly
+                calls.clear()
+                out_raw = translate_srt(
+                    srt_in,
+                    defaults_path=cfg_path,
+                    resegment_override=False,
+                    output_path=d / "out_raw.srt",
+                )
+                cues_raw = parse_srt(out_raw)
+                self.assertEqual(calls, ["translate"])
+                self.assertEqual(len(cues_raw), 1)
+
+                # Standalone resegment_file works on .words.json directly (hits cache from first run!)
+                calls.clear()
+                out_standalone = resegment_file(d / "demo.words.json", defaults_path=cfg_path, output_path=d / "reseg_only.srt")
+                self.assertEqual(calls, [])  # cached!
+                self.assertEqual(len(parse_srt(out_standalone)), 2)
+
+    def test_resegment_cli_flags_and_config_defaults(self) -> None:
+        parser = autosub_main.build_parser()
+        a_tr = parser.parse_args(["transcript", "vod.mp4", "--no-words-json", "--words-output", "w.words.json"])
+        self.assertIs(a_tr.save_words_json, False)
+        self.assertEqual(a_tr.words_output, "w.words.json")
+
+        a_tl = parser.parse_args([
+            "translate", "vod.srt", "--words-json", "vod.words.json", "--no-resegment", "--max-cue-chars", "22",
+        ])
+        self.assertEqual(a_tl.words_json, "vod.words.json")
+        self.assertIs(a_tl.resegment, False)
+        self.assertEqual(a_tl.max_cue_chars, 22.0)
+
+        a_run = parser.parse_args([
+            "run", "vod.mp4", "--no-words-json", "--words-output", "mid.words.json", "--no-resegment", "--max-cue-chars", "26",
+        ])
+        self.assertIs(a_run.save_words_json, False)
+        self.assertEqual(a_run.words_output, "mid.words.json")
+        self.assertIs(a_run.resegment, False)
+        self.assertEqual(a_run.max_cue_chars, 26.0)
+
+        a_reseg = parser.parse_args([
+            "resegment", "vod.words.json", "--model", "openai/gpt-6.2-sol",
+            "--reasoning-effort", "high", "--max-cue-chars", "26", "--max-cue-duration", "5.0",
+            "--no-cache", "--log-llm", "-o", "clean.srt",
+        ])
+        self.assertEqual(a_reseg.command, "resegment")
+        self.assertEqual(a_reseg.model, "openai/gpt-6.2-sol")
+        self.assertEqual(a_reseg.reasoning_effort, "high")
+        self.assertEqual(a_reseg.max_cue_chars, 26.0)
+        self.assertEqual(a_reseg.max_cue_duration, 5.0)
+        self.assertIs(a_reseg.use_cache, False)
+        self.assertIs(a_reseg.log_llm, True)
+        self.assertEqual(a_reseg.output, "clean.srt")
+
+        a_cache = parser.parse_args(["cache", "clear", "--namespace", "resegment"])
+        self.assertEqual(a_cache.namespace, "resegment")
+
+        defaults = load_engine_config(PROJECT_ROOT / "config" / "defaults.yaml")
+        self.assertTrue(defaults["transcript"]["save_words_json"])
+        self.assertTrue(defaults["translate"]["resegment"])
+        self.assertEqual(defaults["translate"]["resegment_max_cue_chars"], 28)
 
 
 if __name__ == "__main__":
