@@ -84,6 +84,28 @@ def get_user_config_dir() -> Path | None:
         return None
 
 
+def get_user_cache_dir() -> Path:
+    """Per-user cache directory (`%LOCALAPPDATA%/AutoSub` on Windows, `~/.cache/autosub` elsewhere)."""
+    env_override = os.environ.get("AUTOSUB_CACHE_DIR", "").strip()
+    if env_override:
+        return Path(env_override).expanduser()
+    if os.name == "nt":
+        local_app = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app:
+            return Path(local_app) / "AutoSub" / "cache"
+        try:
+            return Path.home() / "AppData" / "Local" / "AutoSub" / "cache"
+        except RuntimeError:
+            return get_app_root() / ".cache"
+    xdg_cache = os.environ.get("XDG_CACHE_HOME", "").strip()
+    if xdg_cache:
+        return Path(xdg_cache) / "autosub"
+    try:
+        return Path.home() / ".cache" / "autosub"
+    except RuntimeError:
+        return get_app_root() / ".cache"
+
+
 PROJECT_ROOT = get_app_root()
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "defaults.yaml"
 PROFILES_DIR = PROJECT_ROOT / "profiles"
@@ -115,6 +137,44 @@ def get_network_config(defaults: dict[str, Any]) -> dict[str, Any]:
     return {
         "proxy": proxy,
         "timeout_seconds": int(raw_timeout or 180),
+    }
+
+
+def get_cache_config(defaults: dict[str, Any]) -> dict[str, Any]:
+    """Return normalized local SQLite cache settings (`enabled`, `path`, `ttl_days`)."""
+    raw = defaults.get("cache") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    enabled = bool(raw.get("enabled", True))
+    raw_path = str(raw.get("path") or "").strip()
+    cache_path = Path(raw_path).expanduser() if raw_path else (get_user_cache_dir() / "cache.db")
+    try:
+        ttl_days = max(0.0, float(raw.get("ttl_days", 30)))
+    except (TypeError, ValueError):
+        ttl_days = 30.0
+    return {
+        "enabled": enabled,
+        "path": cache_path,
+        "ttl_days": ttl_days,
+    }
+
+
+def get_logging_config(defaults: dict[str, Any]) -> dict[str, Any]:
+    """Return normalized LLM JSONL request logging settings (`llm_requests`, `path`, `max_size_mb`)."""
+    raw = defaults.get("logging") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    llm_requests = bool(raw.get("llm_requests", False))
+    raw_path = str(raw.get("path") or "").strip()
+    log_path = Path(raw_path).expanduser() if raw_path else (get_user_cache_dir() / "logs" / "llm_requests.jsonl")
+    try:
+        max_size_mb = max(0.1, float(raw.get("max_size_mb", 10)))
+    except (TypeError, ValueError):
+        max_size_mb = 10.0
+    return {
+        "llm_requests": llm_requests,
+        "path": log_path,
+        "max_size_mb": max_size_mb,
     }
 
 

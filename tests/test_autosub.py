@@ -12,8 +12,11 @@ from unittest import mock
 import yaml
 
 import main as autosub_main
+from src.cache import ResultCache, make_cache_key
 from src.config import (
     PROJECT_ROOT,
+    get_cache_config,
+    get_logging_config,
     get_providers_config,
     load_engine_config,
     resolve_api_key,
@@ -28,6 +31,7 @@ from src.http_client import (
     post_multipart,
     upload_resumable_file,
 )
+from src.llm_logger import LlmRequestLogger
 from src.profile import (
     list_profiles,
     load_glossary,
@@ -45,6 +49,7 @@ from src.providers import (
     create_translate_provider,
     parse_model_spec,
 )
+from src.providers.base import parse_json_response_text
 from src.providers.elevenlabs import (
     ElevenLabsTranscribeProvider,
     build_elevenlabs_form_fields,
@@ -59,6 +64,7 @@ from src.providers.openai import (
 from src.providers.openai_compat import OpenAICompatTranslateProvider
 from src.srt import (
     SrtCue,
+    _effective_display_chars,
     align_reference_srt,
     append_srt_cues,
     clamp_stretched_words,
@@ -68,6 +74,7 @@ from src.srt import (
     parse_srt,
     parse_srt_ts,
     polish_srt_timing,
+    wrap_subtitle_line,
     write_srt,
 )
 from src.transcribe import (
@@ -82,10 +89,12 @@ from src.translate import (
     SubtitleTranslator,
     _parse_compact_translation,
     _parse_cue_entries,
+    _parse_cue_entries_detailed,
     _resolve_translate_models_and_providers,
     format_cue_lines,
     normalize_translate_chain,
     normalize_translate_model_specs,
+    split_cues_by_gaps,
     split_cues_evenly,
 )
 from src.vad import (
@@ -1306,6 +1315,10 @@ class TestPhaseOneQualityUpgrades(unittest.TestCase):
                         "elevenlabs": {"api_key": "el-k"},
                         "gemini": {"api_key": "gm-k"},
                     },
+                    "cache": {
+                        "enabled": True,
+                        "path": str(d / "cache.db"),
+                    },
                     "transcript": {
                         "vad_mode": "none",
                         "provider": "elevenlabs",
@@ -1343,6 +1356,467 @@ class TestPhaseOneQualityUpgrades(unittest.TestCase):
             self.assertEqual(r_srt.name, "out_ref.srt")
             self.assertIn("на сцене", p_srt.read_text(encoding="utf-8"))
             self.assertIn("на Свене", r_srt.read_text(encoding="utf-8"))
+
+
+class TestReliabilityCacheAndWrapping(unittest.TestCase):
+    def test_split_cues_by_gaps_prefers_silence_pause_and_bounds(self) -> None:
+        # 20 cues, max_per_batch=12 -> 2 batches (ideal boundary at index 10)
+        # Put a big 4.5s silence pause between cue 8 (idx 7) and cue 9 (idx 8)
+        cues: list[SrtCue] = []
+        t = 0.0
+        for i in range(1, 21):
+            cues.append(SrtCue(i, t, t + 1.0, f"line {i}"))
+            t += 5.5 if i == 8 else 1.05
+        batches = split_cues_by_gaps(cues, max_per_batch=12)
+        self.assertEqual([len(b) for b in batches], [8, 12])
+        self.assertTrue(all(1 <= len(b) <= 12 for b in batches))
+        self.assertEqual(batches[0][-1].id, 8)
+        self.assertEqual(batches[1][0].id, 9)
+
+        # Uniform 0.0s gaps without punctuation match exact even split
+        uniform = [SrtCue(i, float(i), float(i + 1), f"t{i}") for i in range(1, 533)]
+        u_batches = split_cues_by_gaps(uniform, max_per_batch=280)
+        self.assertEqual([len(b) for b in u_batches], [266, 266])
+
+        # Uniform gaps with sentence punctuation prefer cutting right after sentence end
+        punct_cues = [
+            SrtCue(i, float(i), float(i + 1), f"word {i}." if i == 9 else f"word {i}")
+            for i in range(1, 21)
+        ]
+        p_batches = split_cues_by_gaps(punct_cues, max_per_batch=12)
+        self.assertEqual(p_batches[0][-1].id, 9)
+        self.assertEqual(p_batches[1][0].id, 10)
+
+    def test_parse_json_response_text_repairs_common_llm_glitches(self) -> None:
+        # Prose wrapper + markdown fence + trailing commas + literal newline inside string
+        noisy = (
+            "Here is the translation result:\n"
+            "```json\n"
+            '{"keep": [[1, "第一行\n第二行",], [2, "保留逗号, ] } 测试",],], "drop": [3,],}\n'
+            "```\n"
+            "Hope this helps!"
+        )
+        parsed = parse_json_response_text(noisy, provider_name="TestLLM")
+        self.assertEqual(parsed["keep"][0], [1, "第一行\n第二行"])
+        self.assertEqual(parsed["keep"][1], [2, "保留逗号, ] } 测试"])
+        self.assertEqual(parsed["drop"], [3])
+
+        # Truly truncated JSON still raises transient 503 ProviderApiError
+        with self.assertRaises(ProviderApiError) as ctx:
+            parse_json_response_text('{"keep": [[1, "unterminated', provider_name="TestLLM")
+        self.assertEqual(ctx.exception.http_status, 503)
+        self.assertTrue(ctx.exception.is_503_transient)
+
+    def test_missing_id_single_turn_self_repair_and_rejected_merge_recovery(self) -> None:
+        batch = [
+            SrtCue(1, 0.0, 1.2, "Привет"),
+            SrtCue(2, 1.3, 2.5, "Омitted line"),
+            SrtCue(3, 2.6, 3.8, "Пошли мид"),
+            SrtCue(4, 3.9, 4.3, "Э..."),
+            SrtCue(5, 5.0, 6.0, "Far part A"),
+            SrtCue(6, 12.0, 13.0, "Far part B"),  # 6s gap -> illegal merge rejected by guardrail
+        ]
+        captured_prompts: list[tuple[str, dict]] = []
+
+        def fake_post(url, payload, **_kw):
+            sys_txt = payload["system_instruction"]["parts"][0]["text"]
+            usr_obj = json.loads(payload["contents"][0]["parts"][0]["text"])
+            captured_prompts.append((sys_txt, usr_obj))
+            if len(captured_prompts) == 1:
+                # Omit ID 2 and ID 4, and emit an illegal wide-gap merge [5, 6]
+                return _mk_resp({
+                    "keep": [
+                        [1, "你好"],
+                        [3, "去中路"],
+                        [[5, 6], "违规合并"],
+                    ],
+                    "drop": [],
+                })
+            # Repair turn receives exact missing IDs [2, 4, 5, 6] + surrounding context
+            return _mk_resp({
+                "keep": [
+                    [2, "被漏掉的那句"],
+                    [5, "远段 A"],
+                    [6, "远段 B"],
+                ],
+                "drop": [4],
+            })
+
+        tr = SubtitleTranslator(
+            api_key="k",
+            models=[{"provider": "gemini", "model": "gemini-4-hydrogen"}],
+            post_fn=fake_post,
+            sleep_fn=lambda _: None,
+        )
+        entries, _m, _t, merged = tr.translate_batch_entries(
+            batch,
+            "FIXED_SYS_PROMPT",
+            [],
+            batch_label="批次 1/1",
+            allow_merge=True,
+            repair_missing=True,
+        )
+        self.assertEqual(len(captured_prompts), 2)
+        # Same system prompt preserved for Prompt Caching hit!
+        self.assertEqual(captured_prompts[0][0], captured_prompts[1][0])
+        repair_usr = captured_prompts[1][1]
+        self.assertEqual([row[0] for row in repair_usr["missing_subtitles"]], [2, 4, 5, 6])
+        self.assertTrue(any(row[0] == 1 for row in repair_usr["surrounding_context"]))
+        self.assertEqual(merged, 0)
+        by_id = {e["ids"][0]: e["target"] for e in entries}
+        self.assertEqual(by_id, {1: "你好", 2: "被漏掉的那句", 3: "去中路", 5: "远段 A", 6: "远段 B"})
+        self.assertNotIn(4, by_id)  # dropped during repair turn
+        phases = [s["phase"] for s in tr.stats]
+        self.assertEqual(phases, ["repair", "translate"])
+        tl_stat = [s for s in tr.stats if s["phase"] == "translate"][0]
+        self.assertEqual((tl_stat["kept"], tl_stat["dropped"]), (5, 1))
+
+        # When repair_missing=False, no second API call is made and safe fallback preserves source text
+        calls_no_repair = 0
+
+        def fake_post_once(url, payload, **_kw):
+            nonlocal calls_no_repair
+            calls_no_repair += 1
+            return _mk_resp({"keep": [[1, "你好"]], "drop": []})
+
+        tr_off = SubtitleTranslator(
+            api_key="k",
+            models=[{"provider": "gemini", "model": "gemini-4-hydrogen"}],
+            post_fn=fake_post_once,
+            sleep_fn=lambda _: None,
+        )
+        entries_off, *_ = tr_off.translate_batch_entries(
+            batch[:2], "SYS", [], repair_missing=False,
+        )
+        self.assertEqual(calls_no_repair, 1)
+        self.assertEqual([e["target"] for e in entries_off], ["你好", "Омitted line"])
+
+    def test_sqlite_cache_translate_pass0_fallback_isolation_and_asr_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            db_path = d / "cache.db"
+            cache = ResultCache(db_path, enabled=True, ttl_days=30)
+
+            # 1. Direct cache CRUD, stats, namespace clear, and TTL expiry
+            k1 = make_cache_key("asr", {"x": 1})
+            k2 = make_cache_key("translate", {"x": 2})
+            cache.set("asr", k1, {"ok": 1})
+            cache.set("translate", k2, {"ok": 2})
+            self.assertEqual(cache.get("asr", k1), {"ok": 1})
+            st = cache.stats()
+            self.assertEqual(st["total"], 2)
+            self.assertEqual(st["by_namespace"], {"asr": 1, "translate": 1})
+            removed = cache.clear("translate")
+            self.assertEqual(removed, 1)
+            self.assertIsNone(cache.get("translate", k2))
+            self.assertEqual(cache.get("asr", k1), {"ok": 1})
+            cache.clear("all")
+            self.assertEqual(cache.stats()["total"], 0)
+
+            # 2. Pass-0 + batch translate caching & zero-cost re-formatting on wrap/bilingual change
+            cues = [
+                SrtCue(1, 0.0, 2.0, "Hello everyone, today we push mid together."),
+                SrtCue(2, 2.5, 4.5, "Watch out for the smoke gank right now!"),
+            ]
+            api_calls = 0
+
+            def fake_post(url, payload, **_kw):
+                nonlocal api_calls
+                api_calls += 1
+                sys_txt = payload["system_instruction"]["parts"][0]["text"]
+                if "pre-analysis" in sys_txt:
+                    return _mk_resp({"summary": "Mid push", "key_entities": ["Visage"]})
+                return _mk_resp({
+                    "keep": [
+                        [1, "大家好，今天我们一起中路抱团推进拿下对面二塔再打肉山吧。"],
+                        [2, "小心对面开雾抓人！"],
+                    ],
+                    "drop": [],
+                })
+
+            tr1 = SubtitleTranslator(
+                api_key="k",
+                models=[{"provider": "gemini", "model": "gemini-4-hydrogen"}],
+                post_fn=fake_post,
+                sleep_fn=lambda _: None,
+                cache=cache,
+            )
+            out1 = tr1.translate_cues(cues, system_prompt="SYS_V1", auto_context=True, bilingual=True, max_line_chars=0)
+            self.assertEqual(api_calls, 2)  # Pass 0 + 1 translate batch
+            self.assertNotIn("\n", out1[0][2][0])
+
+            # Second run with SAME prompt/cues but different output formatting (mono + balanced wrap) -> 0 API calls!
+            tr2 = SubtitleTranslator(
+                api_key="k",
+                models=[{"provider": "gemini", "model": "gemini-4-hydrogen"}],
+                post_fn=fake_post,
+                sleep_fn=lambda _: None,
+                cache=cache,
+            )
+            out2 = tr2.translate_cues(cues, system_prompt="SYS_V1", auto_context=True, bilingual=False, max_line_chars=18)
+            self.assertEqual(api_calls, 2)  # zero additional network calls!
+            self.assertEqual(len(out2[0][2]), 1)  # mono
+            self.assertIn("\n", out2[0][2][0])  # re-wrapped at 18 CJK chars
+            self.assertTrue(all(s.get("cache_hit") for s in tr2.stats))
+
+            # Third run with modified glossary/system prompt -> cache miss & re-calls translate
+            tr3 = SubtitleTranslator(
+                api_key="k",
+                models=[{"provider": "gemini", "model": "gemini-4-hydrogen"}],
+                post_fn=fake_post,
+                sleep_fn=lambda _: None,
+                cache=cache,
+            )
+            tr3.translate_cues(cues, system_prompt="SYS_V2_NEW_GLOSSARY", auto_context=True)
+            self.assertEqual(api_calls, 3)  # Pass 0 still cached, translate re-called once!
+
+            # 3. Fallback isolation: backup model output must NOT pollute primary model cache slot
+            fb_calls: list[str] = []
+
+            def fake_fallback(url, payload, **_kw):
+                fb_calls.append(url)
+                if "gemini-4-hydrogen" in url:
+                    raise ProviderApiError("503", "busy", http_status=503, provider="Gemini")
+                return _mk_resp({"keep": [[1, "降级译文"]], "drop": []})
+
+            tr_fb = SubtitleTranslator(
+                api_key="k",
+                models=[
+                    {"provider": "gemini", "model": "gemini-4-hydrogen"},
+                    {"provider": "gemini", "model": "gemini-3.5-flash-lite"},
+                ],
+                retry_503=1,
+                post_fn=fake_fallback,
+                sleep_fn=lambda _: None,
+                cache=cache,
+            )
+            tr_fb.translate_cues([SrtCue(1, 0.0, 1.0, "Unique fallback cue")], system_prompt="FB_SYS")
+            self.assertEqual(len(fb_calls), 2)
+            # Re-running with primary recovered must NOT hit the backup model's cached entry
+            recovered_calls = 0
+
+            def fake_recovered(url, payload, **_kw):
+                nonlocal recovered_calls
+                recovered_calls += 1
+                return _mk_resp({"keep": [[1, "主力恢复译文"]], "drop": []})
+
+            tr_rec = SubtitleTranslator(
+                api_key="k",
+                models=[{"provider": "gemini", "model": "gemini-4-hydrogen"}],
+                post_fn=fake_recovered,
+                sleep_fn=lambda _: None,
+                cache=cache,
+            )
+            out_rec = tr_rec.translate_cues([SrtCue(1, 0.0, 1.0, "Unique fallback cue")], system_prompt="FB_SYS")
+            self.assertEqual(recovered_calls, 1)
+            self.assertEqual(out_rec[0][2][0], "主力恢复译文")
+
+            # 4. ASR chunk caching: single-ASR then enabling dual-ASR reuses primary from cache (0 primary calls!)
+            cfg_single = d / "single.yaml"
+            cfg_dual = d / "dual.yaml"
+            base_cfg = {
+                "providers": {"elevenlabs": {"api_key": "el-k"}, "gemini": {"api_key": "gm-k"}},
+                "cache": {"enabled": True, "path": str(db_path)},
+                "transcript": {"vad_mode": "none", "provider": "elevenlabs", "model": "scribe_v3"},
+            }
+            cfg_single.write_text(yaml.safe_dump(base_cfg), encoding="utf-8")
+            dual_cfg = json.loads(json.dumps(base_cfg))
+            dual_cfg["transcript"]["ref_enabled"] = True
+            dual_cfg["transcript"]["ref_model"] = "gemini-3.5-transcribe"
+            cfg_dual.write_text(yaml.safe_dump(dual_cfg), encoding="utf-8")
+
+            media = d / "sample.wav"
+            media.write_bytes(b"RIFF")
+            el_hits = 0
+            gm_hits = 0
+
+            def fake_subproc(cmd, **_kw):
+                Path(cmd[-1]).write_bytes(b"\x00" * (16000 * 4))
+
+            def fake_el(*_a, **_kw):
+                nonlocal el_hits
+                el_hits += 1
+                return {"language_code": "rus", "words": [{"text": "привет", "start": 0.1, "end": 0.6, "type": "word"}]}
+
+            def fake_gm(*_a, **_kw):
+                nonlocal gm_hits
+                gm_hits += 1
+                return {"steps": [{"content": [{"annotations": [{"type": "word_info", "text": "привет", "start_offset": "0.1s", "end_offset": "0.6s"}]}]}]}
+
+            with (
+                mock.patch("src.transcribe.subprocess.run", side_effect=fake_subproc),
+                mock.patch("src.transcribe.render_chunk_mp3", side_effect=lambda pcm, cm, out_p, **kw: out_p.write_bytes(b"SAME_MP3_BYTES")),
+                mock.patch("src.providers.elevenlabs.post_multipart", side_effect=fake_el),
+                mock.patch("src.providers.gemini.upload_resumable_file", return_value={"name": "files/1", "uri": "https://x/1"}),
+                mock.patch("src.providers.gemini.call_gemini_interactions_transcribe", side_effect=fake_gm),
+                mock.patch("src.providers.gemini.delete_url"),
+            ):
+                transcribe_media_pair(media, defaults_path=cfg_single, output_path=d / "s1.srt")
+                self.assertEqual((el_hits, gm_hits), (1, 0))
+                # Now enable dual-ASR -> primary hits cache, ONLY Gemini reference calls API!
+                transcribe_media_pair(media, defaults_path=cfg_dual, output_path=d / "s2.srt")
+                self.assertEqual((el_hits, gm_hits), (1, 1))
+                # Explicit use_cache_override=False bypasses cache for both
+                transcribe_media_pair(media, defaults_path=cfg_dual, output_path=d / "s3.srt", use_cache_override=False)
+                self.assertEqual((el_hits, gm_hits), (2, 2))
+
+    def test_llm_request_logger_jsonl_and_rotation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "llm.jsonl"
+            logger = LlmRequestLogger(log_path, enabled=True, max_size_bytes=1024)
+
+            attempt_n = 0
+
+            def fake_post(url, payload, **_kw):
+                nonlocal attempt_n
+                attempt_n += 1
+                if attempt_n == 1:
+                    raise ProviderApiError("503", "overloaded", http_status=503, provider="Gemini")
+                return _mk_resp({"keep": [[1, "完成"]], "drop": []})
+
+            tr = SubtitleTranslator(
+                api_key="SUPER_SECRET_KEY_12345",
+                models=[{"provider": "gemini", "model": "gemini-4-hydrogen"}],
+                retry_503=2,
+                post_fn=fake_post,
+                sleep_fn=lambda _: None,
+                llm_logger=logger,
+            )
+            tr.translate_cues([SrtCue(1, 0.0, 1.0, "hi")], system_prompt="PROMPT_TEXT")
+
+            raw = log_path.read_text(encoding="utf-8")
+            self.assertNotIn("SUPER_SECRET_KEY_12345", raw)
+            records = [json.loads(line) for line in raw.strip().splitlines()]
+            self.assertEqual(len(records), 2)
+            self.assertEqual(records[0]["status"], "error")
+            self.assertEqual(records[0]["error"]["http_status"], 503)
+            self.assertEqual(records[1]["status"], "ok")
+            self.assertEqual(records[1]["response"]["keep"], [[1, "完成"]])
+
+            # Trigger rotation by writing beyond 1024 bytes
+            for idx in range(6):
+                logger.log_call(
+                    phase="translate",
+                    task_label=f"t{idx}",
+                    provider="openai",
+                    model="gpt-6.2-sol",
+                    system_prompt="x" * 300,
+                    user_prompt="y" * 300,
+                    status="ok",
+                )
+            self.assertTrue(log_path.is_file())
+            self.assertTrue(log_path.with_name("llm.jsonl.old").is_file())
+
+    def test_wrap_subtitle_line_balanced_cjk_mixed_english_and_punctuation(self) -> None:
+        # Short line stays single-line untouched
+        short = "我大概会选死灵龙吧。"
+        self.assertEqual(wrap_subtitle_line(short, max_line_chars=24), short)
+        # Disabled when max_line_chars <= 0
+        long_zh = "这波我们先不急着打盾，等死灵龙把大招和死灵书全部转好再上。"
+        self.assertEqual(wrap_subtitle_line(long_zh, max_line_chars=0), long_zh)
+
+        # Long Chinese line with natural comma near midpoint splits cleanly after comma
+        wrapped_comma = wrap_subtitle_line(long_zh, max_line_chars=24)
+        lines = wrapped_comma.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0], "这波我们先不急着打盾，")
+        self.assertEqual(lines[1], "等死灵龙把大招和死灵书全部转好再上。")
+        self.assertTrue(all(_effective_display_chars(ln) <= 24 for ln in lines))
+
+        # Clause comma within ±5 CJK chars of midpoint beats breaking mid-phrase
+        clause_zh = "来来来，兄弟们，帮我带个会驱散的野怪过来，求你们了。"
+        c_lines = wrap_subtitle_line(clause_zh, max_line_chars=24).splitlines()
+        self.assertEqual(c_lines, ["来来来，兄弟们，", "帮我带个会驱散的野怪过来，求你们了。"])
+
+        # Long Chinese line without punctuation splits visually balanced (not 24 + 5)
+        no_punct = "我们中路直接抱团推进拿下二塔然后顺手控掉对面的魔方和经验符"
+        w_lines = wrap_subtitle_line(no_punct, max_line_chars=24).splitlines()
+        self.assertEqual(len(w_lines), 2)
+        self.assertLessEqual(abs(len(w_lines[0]) - len(w_lines[1])), 3)
+        self.assertEqual("".join(w_lines), no_punct)
+
+        # Mixed CJK + English words never splits inside English words or orphans quotes/brackets
+        mixed = "我觉得这波对面 Visage 出了 BKB 以后（大概 18 分钟）我们完全打不过团战！"
+        m_lines = wrap_subtitle_line(mixed, max_line_chars=24).splitlines()
+        self.assertEqual(len(m_lines), 2)
+        self.assertIn("Visage", wrapped_all := " ".join(m_lines))
+        self.assertIn("BKB", wrapped_all)
+        self.assertFalse(m_lines[0].endswith("（"))
+        self.assertFalse(m_lines[1].startswith("）"))
+        self.assertFalse(m_lines[1].startswith("！"))
+
+        # English & Cyrillic widths use narrow 0.5 east_asian_width (not CJK 1.0)
+        ru = "Я бы Визажа, наверное, пикну."
+        self.assertLess(_effective_display_chars(ru), 20.0)
+        en_long = "I think we should smoke mid right now and catch their Visage before he finishes BKB."
+        en_lines = wrap_subtitle_line(en_long, max_line_chars=24).splitlines()
+        self.assertEqual(len(en_lines), 2)
+        self.assertEqual(" ".join(en_lines), en_long)  # zero broken words or lost chars
+
+        # format_cue_lines wraps only target text when max_line_chars > 0
+        bilingual_lines = format_cue_lines(long_zh, "Original Russian source line", bilingual=True, max_line_chars=24)
+        self.assertEqual(len(bilingual_lines), 2)
+        self.assertIn("\n", bilingual_lines[0])
+        self.assertEqual(bilingual_lines[1], "Original Russian source line")
+
+    def test_new_cli_flags_and_cache_subcommand(self) -> None:
+        parser = autosub_main.build_parser()
+        a_tr = parser.parse_args(["transcript", "vod.mp4", "--no-cache"])
+        self.assertIs(a_tr.use_cache, False)
+
+        a_tl = parser.parse_args([
+            "translate", "vod.srt",
+            "--no-cache", "--no-repair-missing", "--max-line-chars", "20", "--log-llm",
+        ])
+        self.assertIs(a_tl.use_cache, False)
+        self.assertIs(a_tl.repair_missing, False)
+        self.assertEqual(a_tl.max_line_chars, 20.0)
+        self.assertIs(a_tl.log_llm, True)
+
+        a_run = parser.parse_args([
+            "run", "vod.mp4",
+            "--no-cache", "--no-repair-missing", "--max-line-chars", "0", "--log-llm",
+        ])
+        self.assertIs(a_run.use_cache, False)
+        self.assertIs(a_run.repair_missing, False)
+        self.assertEqual(a_run.max_line_chars, 0.0)
+        self.assertIs(a_run.log_llm, True)
+
+        a_cache_default = parser.parse_args(["cache"])
+        self.assertEqual((a_cache_default.action, a_cache_default.namespace), ("stats", "all"))
+        a_cache_clear = parser.parse_args(["cache", "clear", "--namespace", "asr"])
+        self.assertEqual((a_cache_clear.action, a_cache_clear.namespace), ("clear", "asr"))
+
+        # End-to-end cache CLI stats + clear against isolated temp SQLite DB
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            db_path = d / "cli_cache.db"
+            cfg_path = d / "defaults.yaml"
+            cfg_path.write_text(
+                yaml.safe_dump({"cache": {"enabled": True, "path": str(db_path), "ttl_days": 15}}),
+                encoding="utf-8",
+            )
+            c = ResultCache(db_path)
+            c.set("asr", "asr:1", {"words": []})
+            c.set("translate", "translate:1", {"entries": []})
+
+            buf = io.StringIO()
+            with mock.patch("sys.stdout", buf):
+                rc1 = autosub_main.main(["-c", str(cfg_path), "cache", "stats"])
+                rc2 = autosub_main.main(["-c", str(cfg_path), "cache", "clear", "--namespace", "asr"])
+                rc3 = autosub_main.main(["-c", str(cfg_path), "cache", "stats"])
+            self.assertEqual((rc1, rc2, rc3), (0, 0, 0))
+            out_txt = buf.getvalue()
+            self.assertIn("共 2 条", out_txt)
+            self.assertIn("删除 1 条记录", out_txt)
+            self.assertIn("共 1 条", out_txt)
+
+        # Config defaults verification
+        defaults = load_engine_config(PROJECT_ROOT / "config" / "defaults.yaml")
+        self.assertTrue(get_cache_config(defaults)["enabled"])
+        self.assertFalse(get_logging_config(defaults)["llm_requests"])
+        self.assertTrue(defaults["translate"]["repair_missing"])
+        self.assertEqual(defaults["translate"]["max_line_chars"], 24)
 
 
 if __name__ == "__main__":

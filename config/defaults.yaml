@@ -96,6 +96,10 @@ translate:
   max_merge_duration_s: 6.5
   # 确定性字幕排轴后处理（最短驻留、CPS 读速延展、微间隙桥接，零 API 成本）
   polish_timing: true
+  # 遇到模型偶发漏译或无效合并 ID 时，自动发起 1 轮精确补译（复用固定前缀命中 Prompt Caching）
+  repair_missing: true
+  # 单行译文最大等效中文字符数（超长时自动视觉平衡折行；CJK=1.0, 拉丁/西里尔=0.5；设为 0 关闭折行）
+  max_line_chars: 24
   # Pass 0 全片上下文自动提取（需额外 1 次调用，建议搭配 OpenAI gpt-6.2-sol 或通过 --auto-context 开启）
   auto_context: false
   # 跨厂商模型降级链：RPD/额度耗尽 (429/402) 当轮直接跳过；503 重试满 3 次后切下一级
@@ -113,3 +117,18 @@ translate:
     - provider: "gemini"
       model: "gemini-3.5-flash-lite"
       service_tier: "standard"
+
+cache:
+  # 本地零依赖 SQLite 内容哈希缓存（缓存各段 ASR 与各批翻译结果，断点续跑或调后处理免重复扣费）
+  enabled: true
+  # 留空默认存放于系统用户缓存目录（Windows: %LOCALAPPDATA%/AutoSub/cache/cache.db；Linux/macOS: ~/.cache/autosub/cache.db）
+  path: ""
+  # 缓存自动过期天数（0 表示永不过期）
+  ttl_days: 30
+
+logging:
+  # 开启后将完整 LLM 请求与响应写入轮转 JSONL 日志用于排查坏句（默认关闭；也可通过 --log-llm 临时开启）
+  llm_requests: false
+  # 留空默认存放于系统缓存日志目录（超 max_size_mb 自动轮转为 .jsonl.old）
+  path: ""
+  max_size_mb: 10

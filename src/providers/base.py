@@ -79,29 +79,122 @@ class TranslateBatchResult:
     service_tier: str = "standard"
 
 
+def _extract_balanced_json_object(text: str) -> str | None:
+    """Extract the first balanced top-level `{...}` JSON object span, respecting string quotes."""
+    start = -1
+    depth = 0
+    in_string = False
+    escape = False
+    for idx, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = idx
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    return text[start : idx + 1]
+    return None
+
+
+def _repair_json_syntax(text: str) -> str:
+    """Safely fix common LLM JSON glitches (trailing commas & raw newlines in strings) without touching valid content."""
+    out: list[str] = []
+    in_string = False
+    escape = False
+    n = len(text)
+    i = 0
+    while i < n:
+        ch = text[i]
+        if in_string:
+            if escape:
+                out.append(ch)
+                escape = False
+            elif ch == "\\":
+                out.append(ch)
+                escape = True
+            elif ch == '"':
+                out.append(ch)
+                in_string = False
+            elif ch == "\n":
+                out.append("\\n")
+            elif ch == "\r":
+                out.append("\\r")
+            elif ch == "\t":
+                out.append("\\t")
+            else:
+                out.append(ch)
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == ",":
+            # Drop comma if the next non-whitespace token is a closing `]` or `}`
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "]}":
+                i += 1
+                continue
+
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def parse_json_response_text(raw_text: str, *, provider_name: str = "API") -> dict[str, Any]:
-    """Strip optional markdown JSON fences and parse a JSON object or raise transient ProviderApiError."""
+    """Strip markdown fences, safely repair common LLM JSON glitches, and return a JSON dict."""
     cleaned = (raw_text or "").strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
+
+    candidates: list[str] = [cleaned]
+    extracted = _extract_balanced_json_object(cleaned)
+    if extracted and extracted != cleaned:
+        candidates.append(extracted)
+
+    last_exc: Exception | None = None
+    for cand in candidates:
+        for variant in (cand, _repair_json_syntax(cand)):
+            try:
+                parsed = json.loads(variant)
+            except json.JSONDecodeError as exc:
+                last_exc = exc
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+            last_exc = None
+
+    if last_exc is not None:
         raise ProviderApiError(
             "invalid_json",
-            f"返回非合法 JSON: {exc}",
+            f"返回非合法 JSON: {last_exc}",
             http_status=503,
             provider=provider_name,
-        ) from exc
-    if not isinstance(parsed, dict):
-        raise ProviderApiError(
-            "invalid_json",
-            "模型未返回 JSON 对象",
-            http_status=503,
-            provider=provider_name,
-        )
-    return parsed
+        ) from last_exc
+    raise ProviderApiError(
+        "invalid_json",
+        "模型未返回 JSON 对象",
+        http_status=503,
+        provider=provider_name,
+    )
 
 
 class TranscribeProvider(ABC):
