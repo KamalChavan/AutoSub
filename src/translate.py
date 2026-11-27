@@ -1,4 +1,4 @@
-"""Profile-driven subtitle translation & denoising pipeline (`autosub translate`).
+"""Profile-driven multi-provider subtitle translation & denoising pipeline (`autosub translate`).
 
 Domain-agnostic engine: prompts, terminology glossaries, target language, bilingual/monolingual
 layout, and context variables are all loaded from `profiles/*.yaml` (or any external YAML file)
@@ -6,9 +6,9 @@ and overridden via `--var key=value`.
 
 Features:
 - Even batch splitting (avoiding tiny tail batches)
-- Multi-model fallback chain (`gemini-4-hydrogen -> gemini-3.8-flash -> gemini-3.5-flash-lite`)
+- Cross-provider fallback chain (e.g. `gemini`, `openai/gpt-6.2-sol`, `openai_compatible`)
 - 3 in-place attempts on 503 before stepping down
-- Per-run RPD exhaustion skipping on 429
+- Per-run RPD/quota exhaustion skipping on 429
 - Compact `{keep, drop}` JSON parsing with missing-ID safety & `src` bloat guardrail
 - Real-time stdout progress + incremental per-batch `.srt` disk flushing
 """
@@ -16,13 +16,12 @@ from __future__ import annotations
 
 import json
 import math
-import re
 import time
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
-from src.config import DEFAULT_CONFIG_PATH, load_engine_config, resolve_api_key
-from src.http_client import GeminiApiError, post_json
+from src.config import DEFAULT_CONFIG_PATH, get_providers_config, load_engine_config
+from src.http_client import ProviderApiError, post_json
 from src.profile import (
     load_profile,
     merge_glossaries,
@@ -30,13 +29,29 @@ from src.profile import (
     render_glossary_section,
     render_prompt,
 )
+from src.providers import (
+    ModelSpec,
+    ProviderSettings,
+    TranslateProvider,
+    build_provider_settings,
+    create_translate_provider,
+    parse_model_spec,
+)
 from src.srt import SrtCue, append_srt_cues, parse_srt
 
 DEFAULT_TRANSLATE_MODELS: tuple[dict[str, str], ...] = (
-    {"model": "gemini-4-hydrogen", "service_tier": "standard"},
-    {"model": "gemini-3.8-flash", "service_tier": "standard"},
-    {"model": "gemini-3.5-flash-lite", "service_tier": "standard"},
+    {"provider": "gemini", "model": "gemini-4-hydrogen", "service_tier": "standard"},
+    {"provider": "gemini", "model": "gemini-3.8-flash", "service_tier": "standard"},
+    {"provider": "gemini", "model": "gemini-3.5-flash-lite", "service_tier": "standard"},
 )
+
+_DEFAULT_MODELS_BY_PROTOCOL: dict[str, list[dict[str, str]]] = {
+    "gemini": [dict(m) for m in DEFAULT_TRANSLATE_MODELS],
+    "openai": [
+        {"provider": "openai", "model": "gpt-6.2-sol", "reasoning_effort": "low"},
+        {"provider": "openai", "model": "gpt-6-luna", "reasoning_effort": "low"},
+    ],
+}
 
 
 def split_cues_evenly(cues: list[SrtCue], max_per_batch: int = 280) -> list[list[SrtCue]]:
@@ -56,25 +71,43 @@ def split_cues_evenly(cues: list[SrtCue], max_per_batch: int = 280) -> list[list
     return batches
 
 
+def normalize_translate_model_specs(
+    models: Sequence[Any] | None = DEFAULT_TRANSLATE_MODELS,
+    *,
+    default_provider: str = "gemini",
+    known_providers: Mapping[str, Any] | None = None,
+    provider_override: str | None = None,
+    reasoning_effort_override: str | None = None,
+) -> list[ModelSpec]:
+    """Normalize raw model configs or strings into deduplicated `ModelSpec` entries."""
+    specs: list[ModelSpec] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in models or DEFAULT_TRANSLATE_MODELS:
+        if not isinstance(item, (str, Mapping)):
+            continue
+        spec = parse_model_spec(
+            item,
+            default_provider=default_provider,
+            known_providers=known_providers,
+            provider_override=provider_override,
+            reasoning_effort_override=reasoning_effort_override,
+        )
+        if not spec.model:
+            continue
+        if spec.key not in seen:
+            seen.add(spec.key)
+            specs.append(spec)
+    return specs
+
+
 def normalize_translate_chain(
     models: list[Any] | tuple[Any, ...] | None = DEFAULT_TRANSLATE_MODELS,
 ) -> list[tuple[str, str]]:
+    """Legacy `(model, service_tier)` view of the translation chain."""
     chain: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    for item in models or DEFAULT_TRANSLATE_MODELS:
-        if isinstance(item, str):
-            m, t = item.strip(), "standard"
-        elif isinstance(item, dict):
-            m = str(item.get("model") or "").strip()
-            t = str(item.get("service_tier") or "standard").strip().lower() or "standard"
-        else:
-            continue
-        m = m.removeprefix("google/").removeprefix("models/")
-        if not m:
-            continue
-        if t in ("", "default"):
-            t = "standard"
-        key = (m, t)
+    for spec in normalize_translate_model_specs(models):
+        key = (spec.model, spec.service_tier)
         if key not in seen:
             seen.add(key)
             chain.append(key)
@@ -175,23 +208,25 @@ def format_cue_lines(
 
 
 class SubtitleTranslator:
-    """Multi-model fallback translator with 503 3-attempt retry, 429 RPD skip, and incremental SRT flush."""
+    """Multi-provider fallback translator with 503 3-attempt retry, 429 quota skip, and incremental SRT flush."""
 
     def __init__(
         self,
         *,
-        api_key: str,
-        models: list[Any] | tuple[Any, ...] | None = DEFAULT_TRANSLATE_MODELS,
+        api_key: str = "",
+        models: Sequence[Any] | None = DEFAULT_TRANSLATE_MODELS,
         retry_503: int = 3,
         api_base: str = "https://generativelanguage.googleapis.com/v1beta",
         proxy: str = "",
         timeout: int = 180,
+        providers_map: Mapping[str, ProviderSettings] | None = None,
+        default_provider: str = "gemini",
+        reasoning_effort_override: str | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
         post_fn: Callable[..., dict[str, Any]] | None = None,
         progress_fn: Callable[[str], None] | None = None,
     ) -> None:
         self.api_key = api_key
-        self.chain = normalize_translate_chain(models)
         self.retry_503 = max(1, int(retry_503))
         self.api_base = api_base.rstrip("/")
         self.proxy = proxy
@@ -199,50 +234,40 @@ class SubtitleTranslator:
         self.sleep_fn = sleep_fn
         self.post_fn = post_fn or post_json
         self.progress_fn = progress_fn
-        self.exhausted_models: set[tuple[str, str]] = set()
+
+        self.providers_map: dict[str, ProviderSettings] = dict(providers_map or {})
+        if not self.providers_map:
+            self.providers_map["gemini"] = ProviderSettings(
+                name="gemini",
+                protocol="gemini",
+                api_key=api_key,
+                api_base=self.api_base,
+                proxy=proxy,
+                timeout_seconds=timeout,
+            )
+
+        self.spec_chain: list[ModelSpec] = normalize_translate_model_specs(
+            models,
+            default_provider=default_provider,
+            known_providers=self.providers_map,
+            reasoning_effort_override=reasoning_effort_override,
+        )
+        self.chain: list[tuple[str, str]] = [(s.model, s.service_tier) for s in self.spec_chain]
+        self._adapters: dict[str, TranslateProvider] = {}
+        self.exhausted_models: set[tuple[str, str, str]] = set()
         self.stats: list[dict[str, Any]] = []
 
     def _emit(self, message: str) -> None:
         if self.progress_fn is not None:
             self.progress_fn(message)
 
-    def _call_once(
-        self,
-        model: str,
-        service_tier: str,
-        system_prompt: str,
-        user_prompt: str,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        gen_cfg: dict[str, Any] = {
-            "temperature": 0.2,
-            "responseMimeType": "application/json",
-        }
-        if "lite" not in model.lower():
-            gen_cfg["thinkingConfig"] = {"thinkingLevel": "LOW"}
-
-        payload: dict[str, Any] = {
-            "system_instruction": {"parts": [{"text": system_prompt}]},
-            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-            "generationConfig": gen_cfg,
-        }
-        if service_tier != "standard":
-            payload["service_tier"] = service_tier
-
-        url = f"{self.api_base}/models/{model}:generateContent"
-        resp = self.post_fn(url, payload, api_key=self.api_key, proxy=self.proxy, timeout=self.timeout)
-        candidates = resp.get("candidates") or []
-        if not candidates:
-            raise GeminiApiError("empty_candidates", "未返回有效候选结果", http_status=503)
-        parts = candidates[0].get("content", {}).get("parts") or []
-        raw_text = "".join(str(p.get("text", "")) for p in parts).strip()
-        if raw_text.startswith("```"):
-            raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
-            raw_text = re.sub(r"\s*```$", "", raw_text)
-        try:
-            parsed = json.loads(raw_text)
-        except json.JSONDecodeError as exc:
-            raise GeminiApiError("invalid_json", f"返回非合法 JSON: {exc}", http_status=503) from exc
-        return parsed, resp.get("usageMetadata") or {}
+    def _get_adapter(self, provider_name: str) -> TranslateProvider:
+        if provider_name not in self._adapters:
+            settings = self.providers_map.get(provider_name)
+            if settings is None:
+                raise RuntimeError(f"未配置翻译厂商 `{provider_name}` 的连接参数")
+            self._adapters[provider_name] = create_translate_provider(settings, post_fn=self.post_fn)
+        return self._adapters[provider_name]
 
     def translate_batch(
         self,
@@ -262,78 +287,85 @@ class SubtitleTranslator:
         prefix = f"[{batch_label}] " if batch_label else ""
         last_err: Exception | None = None
 
-        for model, tier in self.chain:
-            key = (model, tier)
-            if key in self.exhausted_models:
-                self._emit(f"  {prefix}跳过当日额度已耗尽模型: {model} ({tier})")
+        for spec in self.spec_chain:
+            if spec.key in self.exhausted_models:
+                self._emit(f"  {prefix}跳过当日额度已耗尽模型: {spec.display_label}")
                 continue
 
+            adapter = self._get_adapter(spec.provider)
             tpm_retried = False
             attempt = 0
             while attempt < self.retry_503:
                 attempt += 1
                 self._emit(
-                    f"  {prefix}正在调用 {model} ({tier}) 翻译 {len(batch)} 条字幕 "
+                    f"  {prefix}正在调用 {spec.display_label} 翻译 {len(batch)} 条字幕 "
                     f"(第 {attempt}/{self.retry_503} 次尝试)..."
                 )
                 try:
                     t0 = time.perf_counter()
-                    parsed, usage = self._call_once(model, tier, system_prompt, user_prompt)
+                    res = adapter.generate_json(spec, system_prompt=system_prompt, user_prompt=user_prompt)
                     elapsed = round(time.perf_counter() - t0, 3)
-                    mapped, kept, dropped = _parse_compact_translation(parsed, batch)
-                    used_tier = str(usage.get("serviceTier") or tier)
+                    mapped, kept, dropped = _parse_compact_translation(res.parsed, batch)
+                    used_tier = res.service_tier or spec.service_tier
                     self.stats.append({
-                        "model": model,
+                        "provider": spec.provider,
+                        "model": spec.model,
                         "service_tier": used_tier,
                         "cues": len(batch),
                         "kept": kept,
                         "dropped": dropped,
                         "elapsed_s": elapsed,
-                        "input_tokens": usage.get("promptTokenCount", 0),
-                        "output_tokens": usage.get("candidatesTokenCount", 0),
+                        "input_tokens": res.input_tokens,
+                        "output_tokens": res.output_tokens,
+                        "cached_tokens": res.cached_tokens,
                     })
+                    cache_part = f" ({res.cached_tokens} cached)" if res.cached_tokens else ""
                     self._emit(
-                        f"  {prefix}成功 ({model}:{used_tier}) | 耗时 {elapsed:.1f}s | "
+                        f"  {prefix}成功 ({spec.provider}/{spec.model}:{used_tier}) | 耗时 {elapsed:.1f}s | "
                         f"保留 {kept} / 过滤 {dropped} | "
-                        f"Token: {usage.get('promptTokenCount', 0)} in / {usage.get('candidatesTokenCount', 0)} out"
+                        f"Token: {res.input_tokens} in{cache_part} / {res.output_tokens} out"
                     )
-                    return mapped, model, used_tier
-                except GeminiApiError as exc:
+                    return mapped, spec.model, used_tier
+                except ProviderApiError as exc:
                     last_err = exc
-                    if exc.is_429_rate_limit:
-                        if not exc.is_daily_quota_exhausted and not tpm_retried and exc.retry_after_seconds is not None:
+                    if exc.is_429_rate_limit or exc.is_billing_or_quota_exhausted:
+                        if (
+                            not exc.is_daily_quota_exhausted
+                            and not tpm_retried
+                            and exc.retry_after_seconds is not None
+                        ):
                             tpm_retried = True
                             attempt -= 1
                             wait_s = exc.retry_after_seconds + 2
-                            self._emit(f"  {prefix}{model} ({tier}) 触发短时限流 (429)，等待 {wait_s}s 后重试...")
+                            self._emit(f"  {prefix}{spec.display_label} 触发短时限流 (429)，等待 {wait_s}s 后重试...")
                             self.sleep_fn(wait_s)
                             continue
-                        self.exhausted_models.add(key)
-                        self._emit(f"  {prefix}{model} ({tier}) 额度耗尽 (429)，本轮跳过并切换下一级模型")
+                        self.exhausted_models.add(spec.key)
+                        self._emit(f"  {prefix}{spec.display_label} 额度耗尽 ({exc.code})，本轮跳过并切换下一级模型")
                         break
                     if exc.is_503_transient:
                         if attempt < self.retry_503:
                             wait_s = 5.0 * attempt
                             self._emit(
-                                f"  {prefix}{model} ({tier}) 遇到 {exc.code} 高负载，"
+                                f"  {prefix}{spec.display_label} 遇到 {exc.code} 高负载，"
                                 f"{wait_s:.0f}s 后原地重试 ({attempt}/{self.retry_503})..."
                             )
                             self.sleep_fn(wait_s)
                             continue
                         self._emit(
-                            f"  {prefix}{model} ({tier}) 连续 {self.retry_503} 次 {exc.code} 失败，切换下一级模型"
+                            f"  {prefix}{spec.display_label} 连续 {self.retry_503} 次 {exc.code} 失败，切换下一级模型"
                         )
                         break
-                    self._emit(f"  {prefix}{model} ({tier}) 报错 ({exc.code})，切换下一级模型")
+                    self._emit(f"  {prefix}{spec.display_label} 报错 ({exc.code})，切换下一级模型")
                     break
                 except Exception as exc:
                     last_err = exc
                     if attempt < self.retry_503:
                         wait_s = 5.0 * attempt
-                        self._emit(f"  {prefix}{model} ({tier}) 异常 ({type(exc).__name__})，{wait_s:.0f}s 后重试...")
+                        self._emit(f"  {prefix}{spec.display_label} 异常 ({type(exc).__name__})，{wait_s:.0f}s 后重试...")
                         self.sleep_fn(wait_s)
                         continue
-                    self._emit(f"  {prefix}{model} ({tier}) 连续异常，切换下一级模型")
+                    self._emit(f"  {prefix}{spec.display_label} 连续异常，切换下一级模型")
                     break
 
         raise RuntimeError(f"所有翻译备选模型均失败: {last_err}") from last_err
@@ -389,6 +421,79 @@ class SubtitleTranslator:
         return output_cues
 
 
+def _resolve_translate_models_and_providers(
+    defaults: dict[str, Any],
+    tl_cfg: dict[str, Any],
+    profile_tl_cfg: dict[str, Any],
+    *,
+    provider_override: str | None = None,
+    model_override: str | None = None,
+    reasoning_effort_override: str | None = None,
+) -> tuple[list[ModelSpec], dict[str, ProviderSettings]]:
+    providers_cfg = get_providers_config(defaults)
+    default_provider = str(tl_cfg.get("provider") or "gemini").strip().lower()
+
+    if model_override:
+        raw_models: list[Any] = [m.strip() for m in model_override.split(",") if m.strip()]
+        specs = normalize_translate_model_specs(
+            raw_models,
+            default_provider=(provider_override or default_provider).strip().lower(),
+            known_providers=providers_cfg,
+            provider_override=provider_override,
+            reasoning_effort_override=reasoning_effort_override,
+        )
+    elif provider_override:
+        ov = provider_override.strip().lower()
+        proto = str((providers_cfg.get(ov) or {}).get("protocol") or ov).strip().lower()
+        preset = _DEFAULT_MODELS_BY_PROTOCOL.get(proto)
+        if not preset:
+            raise ValueError(
+                f"厂商 `{ov}` 没有内置默认翻译模型，请同时通过 `--model` / `--translate-model` 指定模型名"
+            )
+        specs = normalize_translate_model_specs(
+            preset,
+            default_provider=ov,
+            known_providers=providers_cfg,
+            provider_override=ov,
+            reasoning_effort_override=reasoning_effort_override,
+        )
+    else:
+        raw_cfg_models = profile_tl_cfg.get("models") or tl_cfg.get("models") or list(DEFAULT_TRANSLATE_MODELS)
+        specs = normalize_translate_model_specs(
+            raw_cfg_models,
+            default_provider=default_provider,
+            known_providers=providers_cfg,
+            reasoning_effort_override=reasoning_effort_override,
+        )
+
+    if not specs:
+        raise ValueError("翻译模型链为空，请检查 config/defaults.yaml 或 --model 参数")
+
+    unique_providers = list(dict.fromkeys(s.provider for s in specs))
+    providers_map: dict[str, ProviderSettings] = {}
+    missing_errors: list[str] = []
+
+    for pname in unique_providers:
+        try:
+            settings = build_provider_settings(pname, defaults, require_api_key=True)
+            # Validate protocol supports translation early
+            create_translate_provider(settings)
+            providers_map[pname] = settings
+        except ValueError:
+            raise
+        except RuntimeError as exc:
+            missing_errors.append(str(exc))
+
+    if not providers_map:
+        raise RuntimeError("；".join(missing_errors) or "未检测到任何可用翻译厂商的 API Key")
+
+    active_specs = [s for s in specs if s.provider in providers_map]
+    skipped = [p for p in unique_providers if p not in providers_map]
+    if skipped:
+        print(f"[提示] 以下翻译厂商未配置 API Key，本轮自动跳过: {', '.join(skipped)}", flush=True)
+    return active_specs, providers_map
+
+
 def translate_srt(
     input_path: Path,
     *,
@@ -399,6 +504,9 @@ def translate_srt(
     target_language_override: str | None = None,
     bilingual_override: bool | None = None,
     batch_size_override: int | None = None,
+    provider_override: str | None = None,
+    model_override: str | None = None,
+    reasoning_effort_override: str | None = None,
     output_path: Path | None = None,
 ) -> Path:
     """Translate an original-language `.srt` file using a profile and optional `--var` overrides."""
@@ -410,15 +518,19 @@ def translate_srt(
         )
 
     defaults = load_engine_config(defaults_path)
-    api_cfg = defaults.get("api") or {}
     tl_cfg = defaults.get("translate") or {}
-
-    api_key = resolve_api_key(str(api_cfg.get("api_key") or ""))
-    if not api_key:
-        raise RuntimeError("未检测到 Gemini API Key（请设置 GEMINI_API_KEY、创建 .env 或填写 config/defaults.yaml）")
 
     effective_profile_name = profile_name or str(tl_cfg.get("default_profile") or "default")
     profile = load_profile(effective_profile_name)
+
+    active_specs, providers_map = _resolve_translate_models_and_providers(
+        defaults,
+        tl_cfg,
+        profile.translate,
+        provider_override=provider_override,
+        model_override=model_override,
+        reasoning_effort_override=reasoning_effort_override,
+    )
 
     vars_override = parse_var_overrides(vars_list)
     if target_language_override:
@@ -442,10 +554,8 @@ def translate_srt(
     batches = split_cues_evenly(cues, max_per_batch=max_per_batch)
     default_suffix = "_bilingual.srt" if bilingual else "_translated.srt"
     out = output_path or input_path.with_name(f"{input_path.stem}{default_suffix}")
-    models_cfg = profile.translate.get("models") or tl_cfg.get("models") or list(DEFAULT_TRANSLATE_MODELS)
     retry_503 = int(tl_cfg.get("retry_503", 3))
-    chain = normalize_translate_chain(models_cfg)
-    chain_desc = " -> ".join(f"{m}({t})" for m, t in chain)
+    chain_desc = " -> ".join(s.display_label for s in active_specs)
 
     merged_vars = {**profile.default_vars, **vars_override}
     var_summary = ", ".join(f"{k}={v}" for k, v in merged_vars.items()) or "(无)"
@@ -458,13 +568,21 @@ def translate_srt(
     print(f"模型链: {chain_desc}（503 原地重试 {retry_503} 次后切换）", flush=True)
 
     system_prompt = render_prompt(profile, vars_override=vars_override, glossary_text=glossary_text)
+    models_dicts = [
+        {
+            "provider": s.provider,
+            "model": s.model,
+            "service_tier": s.service_tier,
+            "reasoning_effort": s.reasoning_effort,
+            "thinking_level": s.thinking_level,
+            "temperature": s.temperature,
+        }
+        for s in active_specs
+    ]
     translator = SubtitleTranslator(
-        api_key=api_key,
-        models=models_cfg,
+        models=models_dicts,
         retry_503=retry_503,
-        api_base=str(api_cfg.get("api_base") or "https://generativelanguage.googleapis.com/v1beta"),
-        proxy=str(api_cfg.get("proxy") or ""),
-        timeout=int(api_cfg.get("timeout_seconds", 180)),
+        providers_map=providers_map,
         progress_fn=lambda msg: print(msg, flush=True),
     )
     translated = translator.translate_cues(
@@ -477,10 +595,12 @@ def translate_srt(
     )
     total_in = sum(int(s.get("input_tokens", 0)) for s in translator.stats)
     total_out = sum(int(s.get("output_tokens", 0)) for s in translator.stats)
+    total_cached = sum(int(s.get("cached_tokens", 0)) for s in translator.stats)
     total_s = sum(float(s.get("elapsed_s", 0.0)) for s in translator.stats)
+    cache_part = f" ({total_cached} cached)" if total_cached else ""
     print(
         f"[翻译完成] {out} | 输入 {len(cues)} 条 -> 保留 {len(translated)} 条 (过滤 {len(cues) - len(translated)} 条) | "
-        f"纯推理耗时 {total_s:.1f}s | Token: {total_in} in / {total_out} out",
+        f"纯推理耗时 {total_s:.1f}s | Token: {total_in} in{cache_part} / {total_out} out",
         flush=True,
     )
     return out
@@ -496,6 +616,9 @@ def run_translate_cli(
     target_language_override: str | None = None,
     bilingual_override: bool | None = None,
     batch_size_override: int | None = None,
+    provider_override: str | None = None,
+    model_override: str | None = None,
+    reasoning_effort_override: str | None = None,
     output_path: Path | None = None,
 ) -> int:
     try:
@@ -508,6 +631,9 @@ def run_translate_cli(
             target_language_override=target_language_override,
             bilingual_override=bilingual_override,
             batch_size_override=batch_size_override,
+            provider_override=provider_override,
+            model_override=model_override,
+            reasoning_effort_override=reasoning_effort_override,
             output_path=output_path,
         )
         return 0

@@ -11,14 +11,16 @@ from src.config import (
     DEFAULT_CONFIG_PATH,
     get_app_root,
     get_bundle_root,
+    get_providers_config,
     is_frozen,
     load_engine_config,
-    resolve_api_key,
     resolve_binary,
+    resolve_provider_api_key,
 )
 from src.profile import list_profiles
+from src.providers import provider_capabilities
 from src.transcribe import run_transcript_cli, transcribe_media
-from src.translate import run_translate_cli, translate_srt
+from src.translate import normalize_translate_model_specs, run_translate_cli, translate_srt
 from src.vad import probe_silero_vad_runtime
 
 
@@ -33,7 +35,7 @@ def _configure_console_utf8() -> None:
                 pass
 
 
-def _add_transcript_args(p: argparse.ArgumentParser) -> None:
+def _add_transcript_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--vad",
         choices=["silero_onnx", "silencedetect", "none"],
@@ -41,19 +43,57 @@ def _add_transcript_args(p: argparse.ArgumentParser) -> None:
         help="覆盖本地人声裁剪模式（默认读取 profile / config/defaults.yaml）",
     )
     p.add_argument(
-        "--model",
-        default=None,
-        help="覆盖语音转写模型（默认 gemini-3.5-transcribe）",
-    )
-    p.add_argument(
         "--max-chunk-seconds",
         type=float,
         default=None,
-        help="单次转写音频分段上限秒数（默认 1680s，需 <= 1800s 以支持词级时间戳）",
+        help="单次转写音频分段上限秒数（默认 1680s；Gemini 词级时间戳上限 1800s，Whisper 类受 24MB 文件体积限制）",
+    )
+    p.add_argument(
+        "--lang",
+        default=None,
+        help="可选：主语音语言代码（如 rus / eng / zho / jpn，ElevenLabs Scribe 与 Whisper 生效）",
+    )
+    p.add_argument(
+        "--secondary-lang",
+        action="append",
+        default=[],
+        metavar="CODE",
+        help="可选：次语言代码（可重复，仅 ElevenLabs scribe_v3 混语场景生效，如 --secondary-lang eng）",
+    )
+    p.add_argument(
+        "--keyterm",
+        action="append",
+        default=[],
+        metavar="TERM",
+        help="可选：专有名词热词（可重复，ElevenLabs Scribe 生效，注意会增加 +25%% 计费）",
+    )
+    p.add_argument(
+        "--diarize",
+        action="store_true",
+        default=None,
+        help="可选：开启说话人分离（ElevenLabs Scribe 生效，自动按说话人切换断句）",
+    )
+    p.add_argument(
+        "--no-verbatim",
+        action="store_true",
+        default=None,
+        help="可选：过滤口癖/填充词/结巴（ElevenLabs Scribe 生效）",
+    )
+    p.add_argument(
+        "--numbers-format",
+        choices=["digits", "words"],
+        default=None,
+        help="可选：数字输出格式（仅 ElevenLabs scribe_v3 生效：digits 或 words）",
     )
 
 
 def _add_translate_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--reasoning-effort",
+        choices=["low", "medium", "high", "xhigh", "max"],
+        default=None,
+        help="覆盖 OpenAI GPT-6 推理深度（默认 low；gpt-6.2-sol 不支持 none）",
+    )
     p.add_argument(
         "--var",
         action="append",
@@ -98,7 +138,7 @@ def _add_translate_args(p: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="autosub",
-        description="通用视频/音频本地 VAD 语音转录 + Profile 驱动双语字幕翻译工具",
+        description="通用视频/音频本地 VAD 多厂商语音转录 + Profile 驱动双语字幕翻译工具",
     )
     parser.add_argument(
         "-c",
@@ -119,9 +159,19 @@ def build_parser() -> argparse.ArgumentParser:
         "-p",
         "--profile",
         default=None,
-        help="可选：Profile 名称或外部 YAML 路径（用于读取专属 VAD/分段参数）",
+        help="可选：Profile 名称或外部 YAML 路径（用于读取专属 VAD/分段/语种参数）",
     )
-    _add_transcript_args(tr_parser)
+    tr_parser.add_argument(
+        "--provider",
+        default=None,
+        help="覆盖语音转录厂商（如 gemini / elevenlabs / openai / openai_compatible）",
+    )
+    tr_parser.add_argument(
+        "--model",
+        default=None,
+        help="覆盖语音转写模型（支持 provider/model 前缀，如 gemini-3.5-transcribe / elevenlabs/scribe_v3）",
+    )
+    _add_transcript_common_args(tr_parser)
     tr_parser.add_argument("-o", "--output", default=None, help="输出原语 .srt 路径（默认同目录同名 .srt）")
 
     # 2. translate
@@ -135,6 +185,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile",
         default=None,
         help="Profile 名称（如 default / twitch_dota2）或任意外部 YAML 文件路径",
+    )
+    tl_parser.add_argument(
+        "--provider",
+        default=None,
+        help="覆盖字幕翻译厂商（如 gemini / openai / openai_compatible 或自定义厂商名）",
+    )
+    tl_parser.add_argument(
+        "--model",
+        default=None,
+        help="覆盖翻译模型或逗号分隔降级链（如 openai/gpt-6.2-sol,gemini/gemini-4-hydrogen）",
     )
     _add_translate_args(tl_parser)
     tl_parser.add_argument("-o", "--output", default=None, help="输出翻译后 .srt 路径")
@@ -151,21 +211,49 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Profile 名称（如 default / twitch_dota2）或任意外部 YAML 文件路径",
     )
-    _add_transcript_args(run_parser)
+    run_parser.add_argument(
+        "--transcript-provider",
+        default=None,
+        help="覆盖语音转录厂商（如 elevenlabs / gemini / openai）",
+    )
+    run_parser.add_argument(
+        "--transcript-model",
+        "--model",
+        dest="transcript_model",
+        default=None,
+        help="覆盖语音转写模型（如 elevenlabs/scribe_v3 / gemini-3.5-transcribe；--model 为兼容别名）",
+    )
+    _add_transcript_common_args(run_parser)
+    run_parser.add_argument(
+        "--translate-provider",
+        default=None,
+        help="覆盖字幕翻译厂商（如 openai / gemini / openai_compatible）",
+    )
+    run_parser.add_argument(
+        "--translate-model",
+        default=None,
+        help="覆盖翻译模型或逗号分隔降级链（如 openai/gpt-6.2-sol,gemini/gemini-4-hydrogen）",
+    )
     _add_translate_args(run_parser)
     run_parser.add_argument("--srt-output", default=None, help="可选：中间原语 .srt 保存路径")
     run_parser.add_argument("-o", "--output", default=None, help="可选：最终翻译 .srt 保存路径")
 
-    # 4. profiles
+    # 4. providers
+    subparsers.add_parser(
+        "providers",
+        help="列出已配置的多厂商 API 协议、支持能力与 API Key 状态",
+    )
+
+    # 5. profiles
     subparsers.add_parser(
         "profiles",
         help="列出所有内置 Profile 及其可配置的上下文变量",
     )
 
-    # 5. doctor
+    # 6. doctor
     doc_parser = subparsers.add_parser(
         "doctor",
-        help="检查本地运行环境（FFmpeg、Silero VAD ONNX、Profile 与 API Key 配置状态）",
+        help="检查本地运行环境（FFmpeg、Silero VAD ONNX、Profile 与多厂商 API Key 配置状态）",
     )
     doc_parser.add_argument(
         "--strict-bundle",
@@ -176,10 +264,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def run_providers(defaults_path: Path) -> int:
+    defaults = load_engine_config(defaults_path)
+    providers_cfg = get_providers_config(defaults)
+    tr_cfg = defaults.get("transcript") or {}
+    tl_cfg = defaults.get("translate") or {}
+
+    print("=== [AutoSub 已配置厂商与路由] ===", flush=True)
+    for name, cfg in providers_cfg.items():
+        proto = str(cfg.get("protocol") or name)
+        caps = provider_capabilities(proto)
+        api_base = str(cfg.get("api_base") or "") or "(未设置)"
+        api_mode = str(cfg.get("api_mode") or "")
+        mode_part = f" | mode={api_mode}" if api_mode else ""
+        key_ok = bool(resolve_provider_api_key(cfg))
+        env_hint = " / ".join(cfg.get("api_key_envs") or ()) or f"{name.upper()}_API_KEY"
+        key_status = "已配置" if key_ok else f"未配置 ({env_hint})"
+        print(f"  - {name} [protocol={proto}, 能力={caps}{mode_part}]", flush=True)
+        print(f"      api_base: {api_base} | API Key: {key_status}", flush=True)
+
+    tr_provider = str(tr_cfg.get("provider") or "gemini")
+    tr_model = str(tr_cfg.get("model") or "gemini-3.5-transcribe")
+    tl_specs = normalize_translate_model_specs(
+        tl_cfg.get("models"),
+        default_provider=str(tl_cfg.get("provider") or "gemini"),
+        known_providers=providers_cfg,
+    )
+    tl_desc = " -> ".join(s.display_label for s in tl_specs)
+    print(f"默认转录路由: {tr_provider}/{tr_model}", flush=True)
+    print(f"默认翻译链: {tl_desc}", flush=True)
+    return 0
+
+
 def run_doctor(defaults_path: Path, *, strict_bundle: bool = False) -> int:
     defaults = load_engine_config(defaults_path)
     tools_cfg = defaults.get("tools") or {}
-    api_cfg = defaults.get("api") or {}
+    providers_cfg = get_providers_config(defaults)
 
     ffmpeg_resolved = resolve_binary(str(tools_cfg.get("ffmpeg_bin") or ""), ["ffmpeg.exe", "ffmpeg"])
     ffmpeg_ok = Path(ffmpeg_resolved).is_file() or shutil.which(ffmpeg_resolved) is not None
@@ -188,7 +308,7 @@ def run_doctor(defaults_path: Path, *, strict_bundle: bool = False) -> int:
 
     profiles = list_profiles()
     profiles_ok = len(profiles) > 0
-    api_key_ok = bool(resolve_api_key(str(api_cfg.get("api_key") or "")))
+    gemini_ok = bool(resolve_provider_api_key(providers_cfg["gemini"]))
 
     print("=== [AutoSub 环境自检] ===", flush=True)
     print(f"运行模式: {'独立打包版 (Frozen)' if is_frozen() else 'Python 源码模式'}", flush=True)
@@ -202,7 +322,17 @@ def run_doctor(defaults_path: Path, *, strict_bundle: bool = False) -> int:
         flush=True,
     )
     print(f"内置 Profile: {', '.join(n for n, _, _ in profiles) or '未找到'}", flush=True)
-    print(f"Gemini API Key: {'已配置' if api_key_ok else '未配置（请设置 GEMINI_API_KEY 或创建 .env）'}", flush=True)
+    print(f"Gemini API Key: {'已配置' if gemini_ok else '未配置（请设置 GEMINI_API_KEY 或创建 .env）'}", flush=True)
+    print("多厂商 API Key 状态:", flush=True)
+    for name, cfg in providers_cfg.items():
+        if name == "gemini":
+            continue
+        proto = str(cfg.get("protocol") or name)
+        caps = provider_capabilities(proto)
+        key_ok = bool(resolve_provider_api_key(cfg))
+        env_hint = " / ".join(cfg.get("api_key_envs") or ()) or f"{name.upper()}_API_KEY"
+        status = "已配置" if key_ok else f"未配置（可选，环境变量 {env_hint}）"
+        print(f"  - {name} ({caps}): {status}", flush=True)
 
     if strict_bundle and not (ffmpeg_ok and silero_ok and profiles_ok):
         print("[自检失败] 打包验收模式要求 FFmpeg、Silero ONNX 与内置 Profile 全部就绪。", flush=True)
@@ -218,6 +348,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "doctor":
         return run_doctor(defaults_path, strict_bundle=args.strict_bundle)
+
+    if args.command == "providers":
+        return run_providers(defaults_path)
 
     if args.command == "profiles":
         items = list_profiles()
@@ -238,8 +371,15 @@ def main(argv: list[str] | None = None) -> int:
             profile_name=args.profile,
             output_path=Path(args.output).resolve() if args.output else None,
             vad_override=args.vad,
+            provider_override=args.provider,
             model_override=args.model,
             max_chunk_seconds_override=args.max_chunk_seconds,
+            language_override=args.lang,
+            secondary_languages_override=args.secondary_lang or None,
+            keyterms_override=args.keyterm or None,
+            diarize_override=args.diarize,
+            no_verbatim_override=args.no_verbatim,
+            numbers_format_override=args.numbers_format,
         )
 
     if args.command == "translate":
@@ -252,6 +392,9 @@ def main(argv: list[str] | None = None) -> int:
             target_language_override=args.target_lang,
             bilingual_override=args.bilingual,
             batch_size_override=args.batch_size,
+            provider_override=args.provider,
+            model_override=args.model,
+            reasoning_effort_override=args.reasoning_effort,
             output_path=Path(args.output).resolve() if args.output else None,
         )
 
@@ -263,8 +406,15 @@ def main(argv: list[str] | None = None) -> int:
                 profile_name=args.profile,
                 output_path=Path(args.srt_output).resolve() if args.srt_output else None,
                 vad_override=args.vad,
-                model_override=args.model,
+                provider_override=args.transcript_provider,
+                model_override=args.transcript_model,
                 max_chunk_seconds_override=args.max_chunk_seconds,
+                language_override=args.lang,
+                secondary_languages_override=args.secondary_lang or None,
+                keyterms_override=args.keyterm or None,
+                diarize_override=args.diarize,
+                no_verbatim_override=args.no_verbatim,
+                numbers_format_override=args.numbers_format,
             )
             if raw_srt is None:
                 return 0
@@ -277,6 +427,9 @@ def main(argv: list[str] | None = None) -> int:
                 target_language_override=args.target_lang,
                 bilingual_override=args.bilingual,
                 batch_size_override=args.batch_size,
+                provider_override=args.translate_provider,
+                model_override=args.translate_model,
+                reasoning_effort_override=args.reasoning_effort,
                 output_path=Path(args.output).resolve() if args.output else None,
             )
             return 0

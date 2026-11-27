@@ -117,8 +117,18 @@ def map_word_to_original(
     return int(best["idx"]), os_, oe_
 
 
+def _join_word_buf(buf: list[dict[str, Any]]) -> str:
+    if not buf:
+        return ""
+    parts = [str(buf[0]["text"])]
+    for w in buf[1:]:
+        sep = " " if w.get("space_before", True) else ""
+        parts.append(sep + str(w["text"]))
+    return "".join(parts)
+
+
 def group_words_to_cues(words: list[dict[str, Any]]) -> list[SrtCue]:
-    """Group word-level timestamps into readable SRT cues without crossing VAD segment boundaries."""
+    """Group word-level timestamps into readable SRT cues without crossing VAD segment or speaker boundaries."""
     if not words:
         return []
     cues: list[SrtCue] = []
@@ -134,16 +144,20 @@ def group_words_to_cues(words: list[dict[str, Any]]) -> list[SrtCue]:
             start = cues[-1].end
         if end <= start:
             end = start + 0.15
-        cues.append(SrtCue(id=len(cues) + 1, start=start, end=end, text=" ".join(w["text"] for w in buf)))
+        cues.append(SrtCue(id=len(cues) + 1, start=start, end=end, text=_join_word_buf(buf)))
         buf = []
 
     for w in words:
         if buf:
             prev = buf[-1]
             gap = float(w["start"]) - float(prev["end"])
-            cur_text = " ".join(x["text"] for x in buf)
+            cur_text = _join_word_buf(buf)
             cur_dur = float(prev["end"]) - float(buf[0]["start"])
-            if w.get("seg") != prev.get("seg") or gap >= 0.8:
+            prev_spk = prev.get("speaker")
+            cur_spk = w.get("speaker")
+            speaker_changed = bool(prev_spk and cur_spk and prev_spk != cur_spk)
+            next_sep_len = 1 if w.get("space_before", True) else 0
+            if w.get("seg") != prev.get("seg") or speaker_changed or gap >= 0.8:
                 flush()
             elif re.search(r"[.!?…。！？]$", prev["text"]) and (
                 len(buf) >= 3 or cur_dur >= 1.8 or len(cur_text) >= 24
@@ -151,7 +165,7 @@ def group_words_to_cues(words: list[dict[str, Any]]) -> list[SrtCue]:
                 flush()
             elif re.search(r"[,;:—，；：]$", prev["text"]) and (len(cur_text) >= 48 or cur_dur >= 4.0):
                 flush()
-            elif len(cur_text) + 1 + len(w["text"]) > 76 or (float(w["end"]) - float(buf[0]["start"])) > 6.0:
+            elif len(cur_text) + next_sep_len + len(w["text"]) > 76 or (float(w["end"]) - float(buf[0]["start"])) > 6.0:
                 flush()
         buf.append(w)
     flush()

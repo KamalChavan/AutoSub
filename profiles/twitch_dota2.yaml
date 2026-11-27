@@ -13,6 +13,9 @@ transcript:
   vad_speech_pad_ms: 500
   vad_silence_gap_s: 0.50
   max_chunk_seconds: 1680
+  # 使用 ElevenLabs scribe_v3 转录俄/英混语 Dota 2 直播时自动生效（Gemini 模式下自动忽略）
+  language_code: "rus"
+  secondary_language_codes: ["eng"]
 
 translate:
   max_cues_per_batch: 280

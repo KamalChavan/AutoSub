@@ -1,21 +1,26 @@
 # AutoSub
 
-通用视频/音频本地 VAD 语音转录与 Profile 驱动单/双语字幕翻译工具。
+通用视频/音频本地 VAD 多厂商语音转录与 Profile 驱动单/双语字幕翻译工具。
 
-引擎代码与业务领域完全解耦：针对特定场景（如 Twitch Dota 2 直播录像、技术讲座、播客、动漫等），只需编写一份 `profiles/<name>.yaml`（指定 Prompt 模板、术语表、目标语言与上下文变量）即可复用全套转录与翻译管线。
+引擎代码与业务领域完全解耦：针对特定场景（如 Twitch Dota 2 直播录像、技术讲座、播客、动漫等），只需编写一份 `profiles/<name>.yaml`（指定 Prompt 模板、术语表、目标语言与上下文变量）即可复用全套转录与翻译管线；同时转录与翻译可自由混搭多家模型厂商。
 
 ## 核心特性
 
 1. **本地纯 ONNX Silero VAD 静音裁剪（零 PyTorch / 零 NumPy）**
-   - 直接通过 Python `ctypes` 调用单份 `onnxruntime.dll` C API，峰值内存 `< 80 MB`，可在低配机上高速运行（约 200 倍实时速度），将长视频中的无人声片段裁剪后打包上传（通常缩减 35%~55% 音频时长），并毫秒级精确映射回原时间轴。
-2. **Gemini 词级时间戳转写（`gemini-3.5-transcribe`）**
-   - 通过纯 Python HTTPS（无需外部 `curl`）上传分段音频至 Gemini Files API，调用 `/v1beta/interactions`（`verbatim` + 词级时间戳），自动清理远端临时文件，每段完成后实时写入 `.srt`。
-3. **Profile + 多术语表驱动字幕翻译**
+   - 直接通过 Python `ctypes` 调用单份 `onnxruntime.dll` C API，峰值内存 `< 80 MB`，可在低配机上高速运行（约 200 倍实时速度），将长视频中的无人声片段裁剪后打包上传（通常缩减 35%~55% 音频时长，直接降低按时长计费的 ASR 成本），并毫秒级精确映射回原时间轴。
+2. **多厂商高精度原生词级时间戳转写（STT）**
+   - **Google Gemini（默认，`gemini-3.5-transcribe`）**：纯 Python HTTPS 上传至 Gemini Files API 并调用 `/v1beta/interactions`（`verbatim` + 词级时间戳），自动清理远端临时文件。
+   - **ElevenLabs Scribe v3 / v2（`elevenlabs/scribe_v3`）**：`POST /v1/speech-to-text` 原生词级时间戳，支持中/英/俄混语次语言（`--secondary-lang`）、数字格式（`--numbers-format`）、去口癖（`--no-verbatim`）、说话人分离自动断句（`--diarize`）以及按需专有名词热词（`--keyterm`）。
+   - **OpenAI / OpenAI 兼容 Whisper 端点**：支持返回 `verbose_json` 词/段时间戳的兼容接口（如 `whisper-1`、Groq Whisper、自建 Faster-Whisper）；自动拒绝无时间戳的 `gpt-transcribe` 以避免字幕漂移。
+   - 全程零重型第三方 SDK（仅依赖 `PyYAML` + 标准库 `urllib.request`），每段完成后实时增量落盘 `.srt`。
+3. **Profile + 多术语表驱动字幕翻译（LLM）**
    - 内置 `default`（通用场景）与 `twitch_dota2`（Twitch 俄/英 Dota 2 直播，附带 126 全英雄与装备/机制术语表 `glossaries/dota2_ru_en_zh.yaml`），也支持传入任意外部 `.yaml` Profile 和 `--glossary` 附加术语表。
    - 支持 `--var key=value` 注入上下文、单/双语切换（`--bilingual` / `--mono`）、均匀分批、防漏号/防串句护栏，每批完成即落盘。
-4. **三级模型自动降级链**
-   - 默认链：`gemini-4-hydrogen (standard) -> gemini-3.8-flash (standard) -> gemini-3.5-flash-lite (standard)`。
-   - 遇到 `503` 高负载时当前模型原地尝试 3 次再向下切换；遇到 `429` 当日 RPD 耗尽时当轮直接熔断跳过。
+4. **多厂商跨模型自动降级链**
+   - **Google Gemini（默认）**：`gemini-4-hydrogen -> gemini-3.8-flash -> gemini-3.5-flash-lite`（全向后兼容）。
+   - **OpenAI（`openai/gpt-6.2-sol`、`openai/gpt-6-luna` 等）**：默认走 `/v1/responses`（将固定系统提示置为 `input` 首条 `developer` 消息以命中 GPT-6.2 Prompt Caching，推理深度默认 `low`），也支持切换 `/v1/chat/completions`。
+   - **OpenAI 兼容网关（`openai_compatible`）**：支持 DeepSeek、OpenRouter、Groq、DashScope、Ollama、vLLM 等任意自定义厂商别名。
+   - 支持跨厂商混排降级（如 `openai/gpt-6.2-sol,gemini/gemini-4-hydrogen`）：遇到 `503` 高负载时当前模型原地尝试 3 次再向下切换；遇到 `429` / `402` 额度耗尽时当轮直接熔断跳过。
 
 ---
 
@@ -32,32 +37,52 @@
 
 ```powershell
 autosub doctor
+autosub providers
 ```
 
-### 2. 配置 Gemini API Key（必填）与代理（可选）
+### 2. 配置各厂商 API Key 与代理（按需配置）
 
-按优先级依次读取，**任选一种方式即可**（推荐方式 ①，Windows 最方便，无需处理 `.env` 文件名）：
+默认启用 **Gemini**（100% 向后兼容旧版 `api.*` 与 `GEMINI_API_KEY`）；如需使用 **ElevenLabs Scribe v3** 或 **OpenAI `gpt-6.2-sol`** 等厂商，只需补充对应 API Key。
 
-1. **方式 ①：直接填写 `config/defaults.yaml`（推荐）**
-   - 在开始菜单点击 **AutoSub → Open AutoSub Config & Profiles Folder**（或进入安装目录 / 解压目录），用记事本打开 `config\defaults.yaml`，填入：
+| 厂商 (`provider`) | 协议 (`protocol`) | 能力 | 默认环境变量 | 推荐模型示例 |
+| :--- | :--- | :--- | :--- | :--- |
+| `gemini`（默认） | `gemini` | STT + LLM | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | `gemini-3.5-transcribe` / `gemini-4-hydrogen` |
+| `elevenlabs` | `elevenlabs` | STT | `ELEVENLABS_API_KEY` | `elevenlabs/scribe_v3`、`elevenlabs/scribe_v2` |
+| `openai` | `openai` | LLM + Whisper STT | `OPENAI_API_KEY` | `openai/gpt-6.2-sol`、`openai/gpt-6-luna` |
+| `openai_compatible` | `openai_compatible` | LLM + Whisper STT | `OPENAI_COMPAT_API_KEY` | DeepSeek / OpenRouter / Groq / Ollama 等 |
+
+按优先级依次读取，**任选一种方式即可**：
+
+1. **方式 ①：直接填写 `config/defaults.yaml`（推荐，Windows 最方便）**
+   - 在开始菜单点击 **AutoSub → Open AutoSub Config & Profiles Folder**（或进入安装/解压目录），打开 `config\defaults.yaml`，在 `providers:` 下按需填写对应 `api_key`（旧版 `api:` 块仍自动兼容）：
      ```yaml
-     api:
-       api_key: "你的_Gemini_API_Key"
-       # 如需代理访问 Google API，可顺便填写（留空则自动继承系统代理）
+     network:
        proxy: ""
+       timeout_seconds: 180
+
+     providers:
+       gemini:
+         api_key: "你的_Gemini_API_Key"
+       elevenlabs:
+         api_key: "你的_ElevenLabs_API_Key"
+       openai:
+         api_key: "你的_OpenAI_API_Key"
      ```
    - 后续覆盖升级安装会自动保留你已修改的 `config\defaults.yaml`。
 
-2. **方式 ②：设置 Windows 用户环境变量（一劳永逸）**
+2. **方式 ②：设置环境变量（一劳永逸）**
    ```powershell
    [Environment]::SetEnvironmentVariable("GEMINI_API_KEY", "你的_Gemini_API_Key", "User")
+   [Environment]::SetEnvironmentVariable("ELEVENLABS_API_KEY", "你的_ElevenLabs_API_Key", "User")
+   [Environment]::SetEnvironmentVariable("OPENAI_API_KEY", "你的_OpenAI_API_Key", "User")
    ```
    设置后重新打开终端生效。
 
 3. **方式 ③：使用 `.env` 文件**
-   - 在安装目录、当前工作目录或 `%APPDATA%\AutoSub\` 下创建 `.env` 文件（注意文件名以点开头，PowerShell 可直接执行 `Set-Content .env "GEMINI_API_KEY=你的Key"`），内容参考 `.env.example`。
+   - 在安装目录、当前工作目录或 `%APPDATA%\AutoSub\` 下创建 `.env` 文件，参考 `.env.example`。
+   - **ElevenLabs 快捷提示**：如果本机已安装 Node.js，也可运行 `npx -y @elevenlabs/cli@latest onboard init` 通过浏览器快速获取 ElevenLabs API Key 或配置其 MCP，再将 Key 写入 `.env` 的 `ELEVENLABS_API_KEY`。
 
-配置完成后再运行一次 `autosub doctor`，看到 `Gemini API Key: 已配置` 即表示就绪。
+配置完成后运行 `autosub doctor` 或 `autosub providers` 确认各厂商状态。
 
 ---
 
@@ -65,13 +90,14 @@ autosub doctor
 
 > 以下示例以 Windows 安装版命令 `autosub` 为准；如果你通过 **Linux / macOS 源码运行**，把 `autosub` 替换为 `python3 main.py` 即可。
 
-### 1. 查看内置 Profile
+### 1. 查看已配置厂商与内置 Profile
 
 ```bash
+autosub providers
 autosub profiles
 ```
 
-### 2. 通用视频/音频一键转录 + 双语翻译（`default` Profile）
+### 2. 通用视频/音频一键转录 + 双语翻译（默认 Gemini 全链路）
 
 ```bash
 autosub run demo.mp4 --var topic="系统架构分享" --var speaker="主讲人"
@@ -84,7 +110,34 @@ autosub transcript demo.mp4
 autosub translate demo.srt --target-lang "Simplified Chinese" --mono
 ```
 
-### 3. Twitch Dota 2 直播录像（`twitch_dota2` Profile）
+### 3. 多厂商混搭：ElevenLabs Scribe v3 转录 + OpenAI `gpt-6.2-sol` 翻译
+
+```bash
+# 一键混搭：Scribe v3 俄/英混语转录 -> gpt-6.2-sol 翻译（429/503 自动降级至 gemini-4-hydrogen）
+autosub run "P02_死灵龙.mp4" \
+  --profile twitch_dota2 \
+  --transcript-model elevenlabs/scribe_v3 \
+  --translate-model openai/gpt-6.2-sol,gemini/gemini-4-hydrogen \
+  --reasoning-effort low \
+  --var hero="死灵龙" --var streamer="4oapm"
+
+# 单独使用 ElevenLabs Scribe v3 转录（支持次语言、说话人分离、去口癖与按需热词）
+autosub transcript "P02_死灵龙.mp4" \
+  --profile twitch_dota2 \
+  --model elevenlabs/scribe_v3 \
+  --lang rus --secondary-lang eng --no-verbatim --numbers-format digits
+
+# 单独使用 OpenAI gpt-6.2-sol 翻译已有 SRT
+autosub translate "P02_死灵龙.srt" \
+  --profile twitch_dota2 \
+  --model openai/gpt-6.2-sol \
+  --reasoning-effort medium \
+  --var hero="死灵龙" --var streamer="4oapm"
+```
+
+> 提示：ElevenLabs `keyterms`（`--keyterm`）会增加 `+25%` 计费，默认关闭，仅在人名/专业词识别困难时按需传入。
+
+### 4. Twitch Dota 2 直播录像（默认 Gemini）
 
 ```bash
 # 一键执行（自动输出原语 .srt 和双语 _bilingual.srt）
@@ -97,10 +150,11 @@ autosub translate "P02_死灵龙.srt" --profile twitch_dota2 --var hero="死灵�
 
 > `--var hero` 和 `--var streamer` 均为选填，不传会由模型从对话推断；但传入本局英雄和主播名可明显提升 ASR 同音纠偏与技能语境翻译准确度。
 
-### 4. 自定义任意领域的 Profile 与术语表
+### 5. 自定义任意领域的 Profile 与术语表
 
 复制安装目录下的 `profiles/default.yaml` 到任意位置（例如 `my_podcast.yaml`），按需修改：
 - `target_language` / `source_language_hint` / `bilingual` / `bilingual_order`
+- `transcript.language_code` / `transcript.secondary_language_codes`（用于 ElevenLabs Scribe v3 / Whisper）
 - `translate.glossaries`：指向一份或多份术语表 YAML（格式：`分类名 -> {目标词: [原语别名1, 别名2]}`）
 - `translate.default_vars`：自定义上下文变量默认值
 - `translate.prompt_template`：使用 `{变量名}` 与 `{glossary_section}`（JSON 示例里的花括号写 `{{` / `}}`）

@@ -12,8 +12,22 @@ from unittest import mock
 import yaml
 
 import main as autosub_main
-from src.config import PROJECT_ROOT, load_engine_config, resolve_api_key, resolve_binary
-from src.http_client import GeminiApiError, post_json, upload_resumable_file
+from src.config import (
+    PROJECT_ROOT,
+    get_providers_config,
+    load_engine_config,
+    resolve_api_key,
+    resolve_binary,
+    resolve_provider_api_key,
+)
+from src.http_client import (
+    GeminiApiError,
+    ProviderApiError,
+    build_multipart_payload,
+    post_json,
+    post_multipart,
+    upload_resumable_file,
+)
 from src.profile import (
     list_profiles,
     load_glossary,
@@ -23,6 +37,26 @@ from src.profile import (
     render_glossary_section,
     render_prompt,
 )
+from src.providers import (
+    ModelSpec,
+    ProviderSettings,
+    build_provider_settings,
+    create_transcribe_provider,
+    create_translate_provider,
+    parse_model_spec,
+)
+from src.providers.elevenlabs import (
+    ElevenLabsTranscribeProvider,
+    build_elevenlabs_form_fields,
+    extract_elevenlabs_words,
+    sanitize_keyterms,
+)
+from src.providers.openai import (
+    OpenAICompatTranscribeProvider,
+    OpenAITranslateProvider,
+    extract_whisper_verbose_words,
+)
+from src.providers.openai_compat import OpenAICompatTranslateProvider
 from src.srt import (
     SrtCue,
     append_srt_cues,
@@ -33,13 +67,15 @@ from src.srt import (
     parse_srt_ts,
     write_srt,
 )
-from src.transcribe import call_gemini_transcribe, extract_words_from_interaction
+from src.transcribe import call_gemini_transcribe, extract_words_from_interaction, map_transcribed_words_to_original
 from src.translate import (
     DEFAULT_TRANSLATE_MODELS,
     SubtitleTranslator,
     _parse_compact_translation,
+    _resolve_translate_models_and_providers,
     format_cue_lines,
     normalize_translate_chain,
+    normalize_translate_model_specs,
     split_cues_evenly,
 )
 from src.vad import (
@@ -486,6 +522,488 @@ class TestWindowsBundleAndHttpClient(unittest.TestCase):
         self.assertTrue(wf_path.is_file())
         wf = yaml.safe_load(wf_path.read_text(encoding="utf-8"))
         self.assertIn("build-windows", wf["jobs"])
+
+
+class TestMultiProviderArchitecture(unittest.TestCase):
+    def test_providers_config_merges_legacy_api_and_custom_aliases(self) -> None:
+        cfg = {
+            "api": {
+                "api_key": "legacy-gem-key",
+                "api_base": "https://custom-gemini.example/v1beta",
+                "proxy": "http://127.0.0.1:7890",
+                "timeout_seconds": 240,
+            },
+            "providers": {
+                "DeepSeek": {
+                    "protocol": "openai_compatible",
+                    "api_key_envs": ["DEEPSEEK_API_KEY"],
+                    "api_base": "https://api.deepseek.com/v1",
+                },
+            },
+        }
+        providers = get_providers_config(cfg)
+        self.assertEqual(providers["gemini"]["api_key"], "legacy-gem-key")
+        self.assertEqual(providers["gemini"]["api_base"], "https://custom-gemini.example/v1beta")
+        self.assertEqual(providers["gemini"]["proxy"], "http://127.0.0.1:7890")
+        self.assertEqual(providers["gemini"]["timeout_seconds"], 240)
+        self.assertEqual(providers["elevenlabs"]["protocol"], "elevenlabs")
+        self.assertEqual(providers["openai"]["api_mode"], "responses")
+        self.assertIn("deepseek", providers)
+        self.assertEqual(providers["deepseek"]["protocol"], "openai_compatible")
+        self.assertEqual(providers["deepseek"]["api_mode"], "chat_completions")
+        self.assertEqual(providers["deepseek"]["proxy"], "http://127.0.0.1:7890")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / ".env").write_text("DEEPSEEK_API_KEY=ds-from-dotenv\n", encoding="utf-8")
+            with mock.patch.dict("os.environ", {}, clear=True):
+                with mock.patch("pathlib.Path.home", side_effect=RuntimeError("no home")):
+                    resolved = resolve_provider_api_key(providers["deepseek"], project_root=root)
+            self.assertEqual(resolved, "ds-from-dotenv")
+
+    def test_parse_model_spec_and_provider_factory_routing(self) -> None:
+        s1 = parse_model_spec("elevenlabs/scribe_v3")
+        self.assertEqual((s1.provider, s1.model), ("elevenlabs", "scribe_v3"))
+
+        s2 = parse_model_spec("scribe_v3")
+        self.assertEqual((s2.provider, s2.model), ("elevenlabs", "scribe_v3"))
+
+        s3 = parse_model_spec("openai/gpt-6.2-sol", reasoning_effort_override="medium")
+        self.assertEqual((s3.provider, s3.model, s3.reasoning_effort), ("openai", "gpt-6.2-sol", "medium"))
+
+        s4 = parse_model_spec("gpt-6.2-sol")
+        self.assertEqual((s4.provider, s4.model), ("openai", "gpt-6.2-sol"))
+
+        s5 = parse_model_spec("models/gemini-3.8-flash")
+        self.assertEqual((s5.provider, s5.model), ("gemini", "gemini-3.8-flash"))
+
+        # Explicit custom provider preserves vendor/model slash (e.g. OpenRouter)
+        s6 = parse_model_spec(
+            {"provider": "openrouter", "model": "openai/gpt-6.2-sol"},
+            known_providers={"openrouter": {"protocol": "openai_compatible"}},
+        )
+        self.assertEqual((s6.provider, s6.model), ("openrouter", "openai/gpt-6.2-sol"))
+
+        # ElevenLabs is STT-only -> rejected for translation
+        el_settings = ProviderSettings(
+            name="elevenlabs",
+            protocol="elevenlabs",
+            api_key="el-key",
+            api_base="https://api.elevenlabs.io/v1",
+        )
+        self.assertIsInstance(create_transcribe_provider(el_settings), ElevenLabsTranscribeProvider)
+        with self.assertRaises(ValueError):
+            create_translate_provider(el_settings)
+
+    def test_multipart_builder_and_provider_error_parsing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            mp3 = Path(td) / "sample.mp3"
+            mp3.write_bytes(b"ID3-FAKE-AUDIO")
+            ctype, body = build_multipart_payload(
+                fields=[
+                    ("model_id", "scribe_v3"),
+                    ("secondary_language_codes", "eng"),
+                    ("secondary_language_codes", "jpn"),
+                ],
+                files=[("file", mp3, "audio/mpeg")],
+                boundary="TESTBOUNDARY",
+            )
+            self.assertEqual(ctype, "multipart/form-data; boundary=TESTBOUNDARY")
+            self.assertIn(b'name="secondary_language_codes"\r\n\r\neng', body)
+            self.assertIn(b'name="secondary_language_codes"\r\n\r\njpn', body)
+            self.assertIn(b'filename="sample.mp3"\r\nContent-Type: audio/mpeg\r\n\r\nID3-FAKE-AUDIO', body)
+
+            # ElevenLabs 402 detail dict error parsing
+            fake_opener = mock.MagicMock()
+            el_err_body = io.BytesIO(
+                json.dumps({"detail": {"status": "quota_exceeded", "message": "Not enough credits"}}).encode()
+            )
+            fake_opener.open.side_effect = urllib.error.HTTPError(
+                "https://api.elevenlabs.io/v1/speech-to-text", 402, "Payment Required", {}, el_err_body
+            )
+            with mock.patch("src.http_client._build_opener", return_value=fake_opener):
+                with self.assertRaises(ProviderApiError) as ctx:
+                    post_multipart(
+                        "https://api.elevenlabs.io/v1/speech-to-text",
+                        fields=[("model_id", "scribe_v3")],
+                        files=[("file", mp3, "audio/mpeg")],
+                        headers={"xi-api-key": "k"},
+                        provider_name="ElevenLabs",
+                    )
+            self.assertEqual(ctx.exception.http_status, 402)
+            self.assertTrue(ctx.exception.is_billing_or_quota_exhausted)
+            self.assertIn("Not enough credits", ctx.exception.message)
+
+        # OpenAI 429 with Retry-After header
+        fake_opener2 = mock.MagicMock()
+        oa_err_body = io.BytesIO(
+            json.dumps({"error": {"type": "rate_limit_exceeded", "code": "rate_limit_exceeded", "message": "RPM limit"}}).encode()
+        )
+        fake_opener2.open.side_effect = urllib.error.HTTPError(
+            "https://api.openai.com/v1/responses", 429, "Too Many Requests", {"Retry-After": "7"}, oa_err_body
+        )
+        with mock.patch("src.http_client._build_opener", return_value=fake_opener2):
+            with self.assertRaises(ProviderApiError) as ctx2:
+                post_json("https://api.openai.com/v1/responses", {"model": "gpt-6.2-sol"}, headers={"Authorization": "Bearer k"})
+        self.assertTrue(ctx2.exception.is_429_rate_limit)
+        self.assertEqual(ctx2.exception.retry_after_seconds, 7)
+
+    def test_elevenlabs_form_fields_v3_vs_v2_and_keyterm_sanitization(self) -> None:
+        cleaned = sanitize_keyterms([
+            "Visage",
+            "Visage",
+            "Black King Bar",
+            "too many words in one single keyterm entry here",
+            "x" * 51,
+            "  Shadow   Fiend \n",
+        ])
+        self.assertEqual(cleaned, ["Visage", "Black King Bar", "Shadow Fiend"])
+
+        v3_fields = build_elevenlabs_form_fields(
+            model="scribe_v3",
+            options={
+                "language_code": "rus",
+                "secondary_language_codes": ["eng", "rus", "eng", "deu"],
+                "numbers_format": "digits",
+                "no_verbatim": True,
+                "diarize": True,
+                "num_speakers": 2,
+                "keyterms": ["Visage", "Roshan"],
+            },
+        )
+        self.assertIn(("model_id", "scribe_v3"), v3_fields)
+        self.assertIn(("timestamps_granularity", "word"), v3_fields)
+        self.assertIn(("tag_audio_events", "false"), v3_fields)
+        self.assertEqual([v for k, v in v3_fields if k == "secondary_language_codes"], ["eng", "deu"])
+        self.assertIn(("numbers_format", "digits"), v3_fields)
+        self.assertIn(("no_verbatim", "true"), v3_fields)
+        self.assertIn(("diarize", "true"), v3_fields)
+        self.assertIn(("num_speakers", "2"), v3_fields)
+        self.assertEqual([v for k, v in v3_fields if k == "keyterms"], ["Visage", "Roshan"])
+
+        # v2 must NOT receive v3-only fields (`secondary_language_codes`, `numbers_format`), and empty keyterms omitted
+        v2_fields = build_elevenlabs_form_fields(
+            model="scribe_v2",
+            options={
+                "language_code": "rus",
+                "secondary_language_codes": ["eng"],
+                "numbers_format": "digits",
+                "keyterms": [],
+            },
+        )
+        keys_v2 = [k for k, _ in v2_fields]
+        self.assertNotIn("secondary_language_codes", keys_v2)
+        self.assertNotIn("numbers_format", keys_v2)
+        self.assertNotIn("keyterms", keys_v2)
+
+    def test_elevenlabs_words_spacing_cjk_diarize_and_retries(self) -> None:
+        # 1. Latin/Russian spacing + skipping audio_event + speaker change splitting
+        resp_ru = {
+            "words": [
+                {"text": "Привет", "start": 0.1, "end": 0.4, "type": "word", "speaker_id": "speaker_0"},
+                {"text": " ", "start": 0.4, "end": 0.45, "type": "spacing"},
+                {"text": "BKB", "start": 0.45, "end": 0.8, "type": "word", "speaker_id": "speaker_0"},
+                {"text": "(laughter)", "start": 0.8, "end": 0.9, "type": "audio_event"},
+                {"text": " ", "start": 0.9, "end": 0.95, "type": "spacing"},
+                {"text": "Да!", "start": 1.0, "end": 1.3, "type": "word", "speaker_id": "speaker_1"},
+            ]
+        }
+        words_ru = extract_elevenlabs_words(resp_ru)
+        self.assertEqual([w.text for w in words_ru], ["Привет", "BKB", "Да!"])
+        self.assertEqual([w.space_before for w in words_ru], [False, True, True])
+        chunks = pack_segments_into_chunks([(10.0, 20.0)], max_chunk_seconds=60.0)
+        mapped_ru = map_transcribed_words_to_original(words_ru, chunks[0])
+        cues_ru = group_words_to_cues(mapped_ru)
+        self.assertEqual(len(cues_ru), 2)
+        self.assertEqual(cues_ru[0].text, "Привет BKB")
+        self.assertEqual(cues_ru[1].text, "Да!")
+
+        # 2. CJK words without `spacing` tokens join cleanly without spurious spaces
+        resp_zh = {
+            "words": [
+                {"text": "今天", "start": 0.0, "end": 0.3, "type": "word"},
+                {"text": "天气", "start": 0.3, "end": 0.6, "type": "word"},
+                {"text": "很好。", "start": 0.6, "end": 0.9, "type": "word"},
+            ]
+        }
+        words_zh = extract_elevenlabs_words(resp_zh)
+        mapped_zh = map_transcribed_words_to_original(words_zh, chunks[0])
+        cues_zh = group_words_to_cues(mapped_zh)
+        self.assertEqual(len(cues_zh), 1)
+        self.assertEqual(cues_zh[0].text, "今天天气很好。")
+
+        # 3. Retries on 429 and fast-fails on 402 credits / 401 unusual activity
+        settings = ProviderSettings(
+            name="elevenlabs",
+            protocol="elevenlabs",
+            api_key="el-test",
+            api_base="https://api.elevenlabs.io/v1",
+        )
+        sleeps: list[float] = []
+        calls = 0
+
+        def fake_mp(url: str, **_kw) -> dict:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise ProviderApiError("429", "too many concurrent", http_status=429, retry_after=4)
+            return {"language_code": "rus", "language_probability": 0.96, "audio_duration_secs": 12.5, "words": resp_ru["words"]}
+
+        provider = ElevenLabsTranscribeProvider(settings, multipart_fn=fake_mp)
+        with tempfile.TemporaryDirectory() as td:
+            mp3 = Path(td) / "c.mp3"
+            mp3.write_bytes(b"MP3")
+            res = provider.transcribe_chunk(mp3, model="scribe_v3", max_retries=3, sleep_fn=sleeps.append)
+            self.assertEqual(len(res.words), 3)
+            self.assertEqual(sleeps, [6])
+            self.assertIn("语种: rus", res.usage_summary)
+
+            p_402 = ElevenLabsTranscribeProvider(
+                settings,
+                multipart_fn=mock.Mock(
+                    side_effect=ProviderApiError("quota_exceeded", "Not enough credits", http_status=402)
+                ),
+            )
+            with self.assertRaises(ProviderApiError) as err_402:
+                p_402.transcribe_chunk(mp3, model="scribe_v3", max_retries=3, sleep_fn=sleeps.append)
+            self.assertIn("ElevenLabs Credits 不足", err_402.exception.message)
+
+            p_401 = ElevenLabsTranscribeProvider(
+                settings,
+                multipart_fn=mock.Mock(
+                    side_effect=ProviderApiError("detected_unusual_activity", "Unusual activity detected", http_status=401)
+                ),
+            )
+            with self.assertRaises(ProviderApiError) as err_401:
+                p_401.transcribe_chunk(mp3, model="scribe_v3", max_retries=3, sleep_fn=sleeps.append)
+            self.assertIn("VPN", err_401.exception.message)
+
+    def test_openai_gpt62_responses_prompt_caching_and_compat_chat(self) -> None:
+        captured: list[tuple[str, dict, dict]] = []
+
+        def fake_post(url: str, payload: dict, *, headers: dict | None = None, **_kw) -> dict:
+            captured.append((url, payload, headers or {}))
+            if url.endswith("/responses"):
+                return {
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": json.dumps({"keep": [[1, "你好"]], "drop": []})}],
+                        }
+                    ],
+                    "usage": {
+                        "input_tokens": 500,
+                        "output_tokens": 60,
+                        "input_tokens_details": {"cached_tokens": 420},
+                    },
+                    "service_tier": "default",
+                }
+            return {
+                "choices": [{"message": {"content": json.dumps({"keep": [[1, "你好compat"]], "drop": []})}}],
+                "usage": {"prompt_tokens": 300, "completion_tokens": 40, "prompt_tokens_details": {"cached_tokens": 100}},
+            }
+
+        oa_settings = ProviderSettings(
+            name="openai",
+            protocol="openai",
+            api_key="sk-test",
+            api_base="https://api.openai.com/v1",
+            api_mode="responses",
+        )
+        oa = OpenAITranslateProvider(oa_settings, post_fn=fake_post)
+        res = oa.generate_json(
+            ModelSpec(provider="openai", model="gpt-6.2-sol", service_tier="flex"),
+            system_prompt="SYS_PROMPT",
+            user_prompt='{"subtitles": [[1, "Hi"]]}',
+        )
+        self.assertEqual(res.parsed, {"keep": [[1, "你好"]], "drop": []})
+        self.assertEqual(res.cached_tokens, 420)
+        url0, pay0, hdr0 = captured[0]
+        self.assertEqual(url0, "https://api.openai.com/v1/responses")
+        self.assertEqual(hdr0["Authorization"], "Bearer sk-test")
+        # System prompt must be first developer item in input (for GPT-6.2 Prompt Caching), not top-level instructions
+        self.assertNotIn("instructions", pay0)
+        self.assertEqual(pay0["input"][0], {"role": "developer", "content": "SYS_PROMPT"})
+        self.assertEqual(pay0["reasoning"], {"effort": "low"})
+        self.assertNotIn("temperature", pay0)
+        self.assertNotIn("service_tier", pay0)  # flex stripped on gpt-6.2-sol
+
+        # gpt-6.2-sol must reject reasoning_effort='none'
+        with self.assertRaises(ValueError):
+            oa.generate_json(
+                ModelSpec(provider="openai", model="gpt-6.2-sol", reasoning_effort="none"),
+                system_prompt="SYS",
+                user_prompt="{}",
+            )
+
+        # OpenAI-compatible provider defaults to /chat/completions and includes temperature for non-reasoning models
+        compat_settings = ProviderSettings(
+            name="deepseek",
+            protocol="openai_compatible",
+            api_key="ds-key",
+            api_base="https://api.deepseek.com/v1",
+        )
+        compat = OpenAICompatTranslateProvider(compat_settings, post_fn=fake_post)
+        res_c = compat.generate_json(
+            ModelSpec(provider="deepseek", model="deepseek-chat"),
+            system_prompt="SYS",
+            user_prompt="{}",
+        )
+        self.assertEqual(res_c.parsed["keep"][0][1], "你好compat")
+        url1, pay1, _hdr1 = captured[1]
+        self.assertEqual(url1, "https://api.deepseek.com/v1/chat/completions")
+        self.assertEqual(pay1["temperature"], 0.2)
+        self.assertNotIn("reasoning_effort", pay1)
+
+    def test_openai_stt_rejects_gpt_transcribe_and_parses_whisper_verbose_json(self) -> None:
+        oa_settings = ProviderSettings(
+            name="openai",
+            protocol="openai",
+            api_key="sk-test",
+            api_base="https://api.openai.com/v1",
+        )
+        stt = OpenAICompatTranscribeProvider(
+            oa_settings,
+            multipart_fn=mock.Mock(
+                return_value={
+                    "language": "english",
+                    "duration": 4.2,
+                    "words": [
+                        {"word": "Hello", "start": 0.1, "end": 0.4},
+                        {"word": "world", "start": 0.5, "end": 0.9},
+                    ],
+                }
+            ),
+        )
+        self.assertEqual(stt.max_chunk_bytes, 24 * 1024 * 1024)
+        with tempfile.TemporaryDirectory() as td:
+            mp3 = Path(td) / "a.mp3"
+            mp3.write_bytes(b"MP3")
+            for bad_model in ("gpt-transcribe", "gpt-live-transcribe", "gpt-4o-transcribe"):
+                with self.assertRaises(ValueError):
+                    stt.transcribe_chunk(mp3, model=bad_model)
+
+            res = stt.transcribe_chunk(mp3, model="whisper-1")
+            self.assertEqual([w.text for w in res.words], ["Hello", "world"])
+
+        # Segment fallback when `words[]` is absent
+        seg_words = extract_whisper_verbose_words({"segments": [{"start": 1.0, "end": 2.5, "text": "Fallback line"}]})
+        self.assertEqual(len(seg_words), 1)
+        self.assertEqual(seg_words[0].text, "Fallback line")
+
+    def test_cross_provider_translation_fallback_openai_to_gemini(self) -> None:
+        calls: list[str] = []
+
+        def fake_post(url: str, payload: dict, **_kw) -> dict:
+            if "api.openai.com" in url:
+                calls.append("openai/gpt-6.2-sol")
+                raise ProviderApiError("insufficient_quota", "quota exhausted", http_status=429, error_type="insufficient_quota")
+            calls.append("gemini/gemini-4-hydrogen")
+            body = json.loads(payload["contents"][0]["parts"][0]["text"])
+            kept = [[cid, f"ZH_{cid}"] for cid, _ in body["subtitles"]]
+            return _mk_resp({"keep": kept, "drop": []})
+
+        pmap = {
+            "openai": ProviderSettings(name="openai", protocol="openai", api_key="sk", api_base="https://api.openai.com/v1", api_mode="responses"),
+            "gemini": ProviderSettings(name="gemini", protocol="gemini", api_key="gk", api_base="https://generativelanguage.googleapis.com/v1beta"),
+        }
+        tr = SubtitleTranslator(
+            models=[
+                {"provider": "openai", "model": "gpt-6.2-sol", "reasoning_effort": "low"},
+                {"provider": "gemini", "model": "gemini-4-hydrogen", "service_tier": "standard"},
+            ],
+            providers_map=pmap,
+            retry_503=2,
+            post_fn=fake_post,
+            sleep_fn=lambda _: None,
+        )
+        out = tr.translate_cues([SrtCue(1, 0.0, 1.0, "a"), SrtCue(2, 1.0, 2.0, "b")], system_prompt="sys", max_cues_per_batch=1)
+        self.assertEqual(len(out), 2)
+        # Batch 1 hits OpenAI -> 429 quota -> switches to Gemini; Batch 2 skips OpenAI directly
+        self.assertEqual(calls, ["openai/gpt-6.2-sol", "gemini/gemini-4-hydrogen", "gemini/gemini-4-hydrogen"])
+
+        # Missing OpenAI key in mixed chain skips OpenAI cleanly and keeps Gemini active
+        defaults = {
+            "providers": {
+                "openai": {"api_key": ""},
+                "gemini": {"api_key": "gk-only"},
+            }
+        }
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with mock.patch("pathlib.Path.home", side_effect=RuntimeError("no home")):
+                specs, resolved_map = _resolve_translate_models_and_providers(
+                    defaults,
+                    {"models": ["openai/gpt-6.2-sol", "gemini/gemini-4-hydrogen"]},
+                    {},
+                )
+        self.assertEqual([s.provider for s in specs], ["gemini"])
+        self.assertEqual(list(resolved_map.keys()), ["gemini"])
+
+    def test_multi_provider_cli_parsing_and_providers_command(self) -> None:
+        parser = autosub_main.build_parser()
+
+        a_prov = parser.parse_args(["providers"])
+        self.assertEqual(a_prov.command, "providers")
+
+        a_tr = parser.parse_args([
+            "transcript", "vod.mp4",
+            "--provider", "elevenlabs",
+            "--model", "scribe_v3",
+            "--lang", "rus",
+            "--secondary-lang", "eng",
+            "--keyterm", "Visage",
+            "--keyterm", "Roshan",
+            "--diarize",
+            "--no-verbatim",
+            "--numbers-format", "digits",
+        ])
+        self.assertEqual(a_tr.provider, "elevenlabs")
+        self.assertEqual(a_tr.model, "scribe_v3")
+        self.assertEqual(a_tr.lang, "rus")
+        self.assertEqual(a_tr.secondary_lang, ["eng"])
+        self.assertEqual(a_tr.keyterm, ["Visage", "Roshan"])
+        self.assertIs(a_tr.diarize, True)
+        self.assertIs(a_tr.no_verbatim, True)
+        self.assertEqual(a_tr.numbers_format, "digits")
+
+        a_tl = parser.parse_args([
+            "translate", "demo.srt",
+            "--provider", "openai",
+            "--model", "openai/gpt-6.2-sol,gemini/gemini-4-hydrogen",
+            "--reasoning-effort", "medium",
+        ])
+        self.assertEqual(a_tl.provider, "openai")
+        self.assertEqual(a_tl.model, "openai/gpt-6.2-sol,gemini/gemini-4-hydrogen")
+        self.assertEqual(a_tl.reasoning_effort, "medium")
+
+        a_run = parser.parse_args([
+            "run", "vod.mp4",
+            "--transcript-provider", "elevenlabs",
+            "--transcript-model", "elevenlabs/scribe_v3",
+            "--translate-provider", "openai",
+            "--translate-model", "openai/gpt-6.2-sol",
+            "--reasoning-effort", "high",
+        ])
+        self.assertEqual(a_run.transcript_provider, "elevenlabs")
+        self.assertEqual(a_run.transcript_model, "elevenlabs/scribe_v3")
+        self.assertEqual(a_run.translate_provider, "openai")
+        self.assertEqual(a_run.translate_model, "openai/gpt-6.2-sol")
+        self.assertEqual(a_run.reasoning_effort, "high")
+
+        # Backward-compatible `--model` alias on `run`
+        a_run_legacy = parser.parse_args(["run", "vod.mp4", "--model", "gemini-3.5-transcribe"])
+        self.assertEqual(a_run_legacy.transcript_model, "gemini-3.5-transcribe")
+
+        # `providers` CLI exits 0 cleanly
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            rc = autosub_main.main(["providers"])
+        self.assertEqual(rc, 0)
+        out_txt = buf.getvalue()
+        self.assertIn("gemini", out_txt)
+        self.assertIn("elevenlabs", out_txt)
+        self.assertIn("openai", out_txt)
+        self.assertIn("openai_compatible", out_txt)
 
 
 if __name__ == "__main__":
