@@ -1,7 +1,9 @@
 """SRT parsing, incremental writing, timestamp remapping, and word-to-cue grouping."""
 from __future__ import annotations
 
+import math
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -249,9 +251,182 @@ def group_words_to_cues(words: list[dict[str, Any]]) -> list[SrtCue]:
     return cues
 
 
+_CLOSING_PUNCT = frozenset("，。！？；：、…,.!?;:)]}》】」』”’—–~～")
+_OPENING_PUNCT = frozenset("([{《【「『“‘")
+_STRONG_BREAK_PUNCT = frozenset("。！？!?；;…")
+_MEDIUM_BREAK_PUNCT = frozenset("，,、：:—–")
+_WRAP_TOKEN_RE = re.compile(
+    r"\s+|[A-Za-z0-9\u00C0-\u024F\u0400-\u04FF]+(?:['’\-./:][A-Za-z0-9\u00C0-\u024F\u0400-\u04FF]+)*%?|."
+)
+
+
+def _char_display_width(ch: str) -> float:
+    """Visual display width in CJK-equivalent units (CJK/fullwidth=1.0, Latin/Cyrillic/ASCII=0.5)."""
+    if ch in ("\n", "\r"):
+        return 0.0
+    return 1.0 if unicodedata.east_asian_width(ch) in ("W", "F") else 0.5
+
+
 def _effective_display_chars(text: str) -> float:
-    """Count display reading units (CJK/wide chars=1.0, ASCII chars=0.5)."""
-    return sum(1.0 if ord(ch) > 127 else 0.5 for ch in (text or "").strip())
+    """Count display reading units (CJK/wide chars=1.0, narrow Latin/Cyrillic/ASCII chars=0.5)."""
+    return sum(_char_display_width(ch) for ch in (text or "").strip())
+
+
+def _tokenize_for_wrap(text: str) -> list[tuple[str, bool, float]]:
+    """Tokenize a single subtitle line into indivisible `(token_text, space_before, display_width)` units."""
+    raw_items: list[tuple[str, bool]] = []
+    pending_space = False
+    for match in _WRAP_TOKEN_RE.finditer(text):
+        piece = match.group(0)
+        if piece.isspace():
+            pending_space = True
+            continue
+        raw_items.append((piece, pending_space and bool(raw_items)))
+        pending_space = False
+
+    # Attach opening punctuation to the following token so it never dangles at line end
+    with_open: list[tuple[str, bool]] = []
+    pending_open = ""
+    pending_open_sp = False
+    for tok, sp in raw_items:
+        if len(tok) == 1 and tok in _OPENING_PUNCT:
+            if not pending_open:
+                pending_open_sp = sp
+            pending_open += tok
+            continue
+        if pending_open:
+            with_open.append((pending_open + tok, pending_open_sp))
+            pending_open = ""
+            pending_open_sp = False
+        else:
+            with_open.append((tok, sp))
+    if pending_open:
+        with_open.append((pending_open, pending_open_sp))
+
+    # Attach closing punctuation to the previous token so it never starts a new line
+    merged: list[tuple[str, bool]] = []
+    for tok, sp in with_open:
+        if len(tok) == 1 and tok in _CLOSING_PUNCT and merged:
+            prev_tok, prev_sp = merged[-1]
+            merged[-1] = (prev_tok + tok, prev_sp)
+        else:
+            merged.append((tok, sp))
+
+    return [(tok, sp, _effective_display_chars(tok)) for tok, sp in merged]
+
+
+def _wrap_single_line(text: str, max_line_chars: float) -> str:
+    cleaned = re.sub(r"\s+", " ", text.strip())
+    if not cleaned or max_line_chars <= 0:
+        return cleaned
+    total_w = _effective_display_chars(cleaned)
+    if total_w <= max_line_chars:
+        return cleaned
+
+    tokens = _tokenize_for_wrap(cleaned)
+    n = len(tokens)
+    if n <= 1:
+        return cleaned
+
+    pref_w = [0.0] * (n + 1)
+    pref_sp = [0.0] * (n + 1)
+    for idx, (_tok, sp, w) in enumerate(tokens):
+        pref_w[idx + 1] = pref_w[idx] + w
+        pref_sp[idx + 1] = pref_sp[idx] + (0.5 if sp else 0.0)
+
+    def span_width(i: int, j: int) -> float:
+        return (pref_w[j] - pref_w[i]) + (pref_sp[j] - pref_sp[i + 1])
+
+    def break_bonus(end_j: int) -> float:
+        if end_j >= n:
+            return 0.0
+        tok_text = tokens[end_j - 1][0]
+        tail = tok_text[-2:] if len(tok_text) >= 2 else tok_text
+        if any(ch in _STRONG_BREAK_PUNCT for ch in tail):
+            return -36.0
+        if any(ch in _MEDIUM_BREAK_PUNCT for ch in tail):
+            return -25.0
+        if tokens[end_j][1]:
+            return -3.0
+        return 0.0
+
+    def solve_for_k(k: int) -> tuple[float, float, list[str]] | None:
+        if k > n:
+            return None
+        target_w = total_w / k
+        inf = float("inf")
+        dp = [[inf] * (n + 1) for _ in range(k + 1)]
+        parent = [[-1] * (n + 1) for _ in range(k + 1)]
+        dp[0][0] = 0.0
+
+        soft_cap = max_line_chars * 1.18
+        for line_idx in range(1, k + 1):
+            min_i = line_idx - 1
+            max_i = n - (k - line_idx + 1)
+            for i in range(min_i, max_i + 1):
+                base_cost = dp[line_idx - 1][i]
+                if base_cost == inf:
+                    continue
+                max_j = n - (k - line_idx)
+                for j in range(i + 1, max_j + 1):
+                    w = span_width(i, j)
+                    if j > i + 1 and w > soft_cap and line_idx < k:
+                        break
+                    overflow = max(0.0, w - max_line_chars)
+                    overflow_pen = (50.0 + 40.0 * overflow * overflow) if overflow > 0 else 0.0
+                    cost = base_cost + (w - target_w) ** 2 + overflow_pen + break_bonus(j)
+                    if cost < dp[line_idx][j]:
+                        dp[line_idx][j] = cost
+                        parent[line_idx][j] = i
+
+        if dp[k][n] == inf:
+            return None
+        ranges: list[tuple[int, int]] = []
+        cur = n
+        for line_idx in range(k, 0, -1):
+            prev = parent[line_idx][cur]
+            if prev < 0:
+                return None
+            ranges.append((prev, cur))
+            cur = prev
+        ranges.reverse()
+
+        lines: list[str] = []
+        max_overflow = 0.0
+        for i, j in ranges:
+            w = span_width(i, j)
+            max_overflow = max(max_overflow, max(0.0, w - max_line_chars))
+            parts = [tokens[i][0]]
+            for m in range(i + 1, j):
+                parts.append((" " if tokens[m][1] else "") + tokens[m][0])
+            lines.append("".join(parts))
+        return dp[k][n], max_overflow, lines
+
+    min_k = max(2, math.ceil(total_w / max_line_chars))
+    best = solve_for_k(min_k)
+    if best is None or best[1] > 1.5:
+        alt = solve_for_k(min_k + 1)
+        if alt is not None and (best is None or alt[1] + 0.5 < best[1]):
+            best = alt
+
+    if best is None:
+        return cleaned
+    return "\n".join(best[2])
+
+
+def wrap_subtitle_line(text: str, *, max_line_chars: float = 24.0) -> str:
+    """Balance-wrap a subtitle string when its visual display width exceeds `max_line_chars` CJK units.
+
+    Set `max_line_chars <= 0` to disable wrapping. Preserves word boundaries and avoids dangling
+    opening/closing punctuation while keeping wrapped lines visually balanced.
+    """
+    raw = (text or "").strip()
+    if not raw or max_line_chars <= 0:
+        return raw
+    if "\n" in raw:
+        parts = [_wrap_single_line(part, max_line_chars) for part in raw.splitlines() if part.strip()]
+        return "\n".join(parts)
+    return _wrap_single_line(raw, max_line_chars)
 
 
 def polish_srt_timing(

@@ -15,16 +15,20 @@
    - 全程零重型第三方 SDK（仅依赖 `PyYAML` + 标准库 `urllib.request`），每段完成后实时增量落盘 `.srt`。
 3. **Profile + 多术语表驱动字幕翻译（LLM）**
    - 内置 `default`（通用场景）与 `twitch_dota2`（Twitch 俄/英 Dota 2 直播，附带 126 全英雄与装备/机制术语表 `glossaries/dota2_ru_en_zh.yaml`），也支持传入任意外部 `.yaml` Profile 和 `--glossary` 附加术语表。
-   - 支持 `--var key=value` 注入上下文、单/双语切换（`--bilingual` / `--mono`）、均匀分批、防漏号/防串句护栏，每批完成即落盘。
+   - 支持 `--var key=value` 注入上下文、单/双语切换（`--bilingual` / `--mono`）、按最大静音间隙智能分批、防串句护栏与轻量 JSON 容错，每批完成即落盘。
 4. **多厂商跨模型自动降级链**
    - **Google Gemini（默认翻译）**：`gemini-4-hydrogen -> gemini-3.8-flash -> gemini-3.5-flash-lite`（全向后兼容旧版 `api.*` 配置）。
    - **OpenAI（`openai/gpt-6.2-sol`、`openai/gpt-6-luna` 等）**：默认走 `/v1/responses`（将固定系统提示置为 `input` 首条 `developer` 消息以命中 GPT-6.2 Prompt Caching，推理深度默认 `low`），也支持切换 `/v1/chat/completions`。
    - **OpenAI 兼容网关（`openai_compatible`）**：支持 DeepSeek、OpenRouter、Groq、DashScope、Ollama、vLLM 等任意自定义厂商别名。
    - 支持跨厂商混排降级（如 `openai/gpt-6.2-sol,gemini/gemini-4-hydrogen`）：遇到 `503` 高负载时当前模型原地尝试 3 次再向下切换；遇到 `429` / `402` 额度耗尽时当轮直接熔断跳过。
-5. **高质量字幕增强管线（双 ASR 交叉仲裁 + Pass 0 上下文 + 智能排轴）**
+5. **高质量字幕增强管线（双 ASR 交叉仲裁 + Pass 0 上下文 + 自修复 + 排轴与折行）**
    - **双 ASR 交叉仲裁**：可在 `config/defaults.yaml` 中直接开关 `transcript.ref_enabled: true`（一次 VAD 切片，并行调用主轨 `elevenlabs/scribe_v3` 与参考轨 `gemini-3.5-transcribe`），经拼写微差降噪后将有效分歧作为 `alt_asr` 喂给翻译模型仲裁纠偏。
    - **Pass 0 全片上下文分析（`--auto-context`）**：分批翻译前通读全片提取概要、人名/外号、出场实体与高频 ASR 错词，注入固定前缀供所有批次缓存复用。
-   - **语义碎句合并 + 确定性 CPS 排轴**：前端吸收 1~2 词孤儿尾词并拦截单字异常拉伸；翻译阶段支持短停顿碎句语义合并（时间戳严格锚定原词边界）；落盘前自动执行最短驻留、CPS 读速延展与微间隙桥接（零时间轴重叠）。
+   - **漏译 ID 1 轮精确自修复（默认开启）**：检测到模型偶发漏译或无效跨间隔合并的 ID 时，复用相同系统提示（命中 Prompt Caching）仅向模型回传缺失条与邻近上下文做 1 轮精准补译，消除静默回退原文。
+   - **语义碎句合并 + 确定性 CPS 排轴 + 视觉平衡折行**：前端吸收 1~2 词孤儿尾词并拦截单字异常拉伸；翻译阶段支持短停顿碎句语义合并（时间戳严格锚定原词边界）；落盘前自动执行最短驻留、CPS 读速延展与微间隙桥接（零时间轴重叠），并对超长单行译文（默认 `> 24` 等效中文字符）按标点与词边界自动视觉平衡折行。
+6. **零依赖本地 SQLite 内容哈希缓存 & 可选调试日志**
+   - 使用标准库 `sqlite3` 按内容哈希缓存各段 ASR、Pass 0 与各批翻译结果：网络中断续跑、单轨升级双 ASR、或调整折行/单双语/排轴参数重跑时秒级命中本地缓存，避免向 ElevenLabs / OpenAI / Gemini 重复扣费（支持 `autosub cache stats/clear` 管理与 `--no-cache` 临时绕过）。
+   - 支持通过 `--log-llm` 或 `logging.llm_requests: true` 记录轮转 JSONL 请求/响应日志（不含 API Key），方便排查具体坏句。
 
 ---
 
@@ -159,7 +163,7 @@ autosub run "P02_死灵龙.mp4" \
   --auto-context
 ```
 
-如果希望**默认常开**双 ASR 与 Pass 0 全片上下文，可直接修改 `config/defaults.yaml`：
+如果希望**默认常开**双 ASR 与 Pass 0 全片上下文，或微调折行/缓存/调试日志，可直接修改 `config/defaults.yaml`：
 
 ```yaml
 transcript:
@@ -172,13 +176,30 @@ translate:
   auto_context: true
   merge_cues: true
   polish_timing: true
+  repair_missing: true
+  max_line_chars: 24     # 超 24 等效中文字符自动视觉平衡折行；设为 0 关闭
+
+cache:
+  enabled: true          # 本地 SQLite 内容哈希缓存（默认开启，TTL 30 天）
+  ttl_days: 30
+
+logging:
+  llm_requests: false    # 设为 true 或加 --log-llm 开启轮转 JSONL 调试日志
 ```
 
-配置好后只需运行 `autosub run "vod.mp4" -p twitch_dota2` 即可全自动跑完（需要单次临时关闭双 ASR 时追加 `--no-ref-transcript`）。
+配置好后只需运行 `autosub run "vod.mp4" -p twitch_dota2` 即可全自动跑完（需要单次临时关闭双 ASR 或缓存时可追加 `--no-ref-transcript` / `--no-cache`）。
+
+查看或清理本地 SQLite 缓存：
+
+```bash
+autosub cache stats
+autosub cache clear                    # 清理全部缓存
+autosub cache clear --namespace asr    # 仅清理 ASR 缓存（支持 all / asr / translate / pass0）
+```
 
 > 提示：
 > - ElevenLabs `keyterms`（`--keyterm`）会增加 `+25%` 计费，默认关闭，仅在人名/专业词识别困难时按需传入。
-> - 翻译阶段默认开启**相邻碎句语义合并**（可 `--no-merge-cues` 关闭）与 **CPS 读速/最短驻留排轴后处理**（可 `--no-polish-timing` 关闭）。
+> - 翻译阶段默认开启**相邻碎句语义合并**（`--no-merge-cues` 关闭）、**漏译 ID 1 轮精确补译**（`--no-repair-missing` 关闭）、**CPS 排轴优化**（`--no-polish-timing` 关闭）与**单行超 24 字视觉平衡折行**（`--max-line-chars 0` 关闭）。
 
 ### 4. Twitch Dota 2 直播录像（`twitch_dota2` Profile）
 
@@ -198,7 +219,7 @@ autosub translate "P02_死灵龙.srt" --profile twitch_dota2 --var hero="死灵�
 复制安装目录下的 `profiles/default.yaml` 到任意位置（例如 `my_podcast.yaml`），按需修改：
 - `target_language` / `source_language_hint` / `bilingual` / `bilingual_order`
 - `transcript.language_code` / `transcript.secondary_language_codes` / `transcript.ref_enabled` / `transcript.ref_model`
-- `translate.auto_context` / `translate.merge_cues` / `translate.polish_timing`
+- `translate.auto_context` / `translate.merge_cues` / `translate.polish_timing` / `translate.repair_missing` / `translate.max_line_chars`
 - `translate.glossaries`：指向一份或多份术语表 YAML（格式：`分类名 -> {目标词: [原语别名1, 别名2]}`）
 - `translate.default_vars`：自定义上下文变量默认值
 - `translate.prompt_template`：使用 `{变量名}` 与 `{glossary_section}`（JSON 示例里的花括号写 `{{` / `}}`）

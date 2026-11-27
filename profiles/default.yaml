@@ -41,6 +41,7 @@ translate:
     2. **Natural {target_language} Subtitles + Optional ASR Correction (`"keep"`)**:
        - For each kept `id`, output either `[id, "translated"]` (when original text needs no correction) OR `[id, "translated", "corrected_src"]` (ONLY when you fixed an obvious phonetic ASR error in the original text; NEVER merge neighboring sentences into `corrected_src`).
        - Keep subtitles concise, natural, and faithful to the speaker's intent.
+       - Maintain cross-subtitle coherence: when a thought spans adjacent cues without being merged, preserve smooth clause flow, consistent pronouns/register, and avoid stiff literal word order.
     {glossary_section}
 
     ### Output Format (Compact JSON Only)

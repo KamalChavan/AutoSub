@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from src.cache import ResultCache, build_result_cache, make_cache_key, sha256_file
 from src.config import (
     DEFAULT_CONFIG_PATH,
     get_providers_config,
@@ -24,6 +25,7 @@ from src.http_client import delete_url, upload_resumable_file
 from src.profile import load_profile
 from src.providers import (
     ModelSpec,
+    TranscribeChunkResult,
     TranscribedWord,
     build_provider_settings,
     create_transcribe_provider,
@@ -200,6 +202,65 @@ def resolve_dual_asr_spec(
     return ref_spec
 
 
+def _asr_chunk_cache_key(
+    audio_sha256: str,
+    spec: ModelSpec,
+    stt_options: dict[str, Any],
+) -> str:
+    return make_cache_key(
+        "asr",
+        {
+            "v": "asr_v1",
+            "audio_sha256": audio_sha256,
+            "provider": spec.provider,
+            "model": spec.model,
+            "options": stt_options,
+        },
+    )
+
+
+def _serialize_chunk_result(res: TranscribeChunkResult) -> dict[str, Any]:
+    return {
+        "usage_summary": res.usage_summary,
+        "words": [
+            {
+                "start": float(w.start),
+                "end": float(w.end),
+                "text": str(w.text),
+                "space_before": bool(w.space_before),
+                "speaker_id": w.speaker_id,
+            }
+            for w in res.words
+        ],
+    }
+
+
+def _deserialize_chunk_result(data: dict[str, Any]) -> TranscribeChunkResult | None:
+    raw_words = data.get("words")
+    if not isinstance(raw_words, list):
+        return None
+    words: list[TranscribedWord] = []
+    for item in raw_words:
+        if not isinstance(item, dict):
+            continue
+        txt = str(item.get("text") or "")
+        if not txt:
+            continue
+        words.append(
+            TranscribedWord(
+                start=float(item.get("start", 0.0)),
+                end=float(item.get("end", 0.0)),
+                text=txt,
+                space_before=bool(item.get("space_before", True)),
+                speaker_id=str(item["speaker_id"]) if item.get("speaker_id") else None,
+            )
+        )
+    return TranscribeChunkResult(
+        words=words,
+        usage_summary=str(data.get("usage_summary") or ""),
+    )
+
+
 def transcribe_media_pair(
     input_path: Path,
     *,
@@ -220,11 +281,14 @@ def transcribe_media_pair(
     diarize_override: bool | None = None,
     no_verbatim_override: bool | None = None,
     numbers_format_override: str | None = None,
+    use_cache_override: bool | None = None,
+    cache: ResultCache | None = None,
 ) -> tuple[Path | None, Path | None]:
     """Transcribe media to primary SRT (and optional reference ASR SRT when dual-ASR is enabled).
 
     Runs FFmpeg decode, Silero VAD, and MP3 chunk encoding ONCE, then dispatches primary + reference
-    providers concurrently per chunk. Returns `(primary_srt_path, ref_srt_path_or_None)`.
+    providers concurrently per chunk (with optional SQLite content-hash chunk caching).
+    Returns `(primary_srt_path, ref_srt_path_or_None)`.
     """
     if not input_path.is_file():
         raise FileNotFoundError(f"找不到输入媒体文件: {input_path}")
@@ -233,6 +297,7 @@ def transcribe_media_pair(
     tools_cfg = defaults.get("tools") or {}
     providers_cfg = get_providers_config(defaults)
     tr_cfg = dict(defaults.get("transcript") or {})
+    effective_cache = cache if cache is not None else build_result_cache(defaults, use_cache_override=use_cache_override)
 
     if profile_name:
         profile = load_profile(profile_name)
@@ -388,17 +453,50 @@ def transcribe_media_pair(
 
         for idx, ch_map in enumerate(chunks, 1):
             mp3_path = tmp_dir / f"chunk_{idx:02d}.mp3"
-            target_desc = (
-                f"{spec.provider} ({spec.model}) + {ref_spec.provider} ({ref_spec.model})"
-                if ref_active and ref_spec is not None
-                else f"{spec.provider} ({spec.model})"
-            )
-            print(f"  -> [分段 {idx}/{len(chunks)}] 正在编码并上传音频至 {target_desc}...", flush=True)
             render_chunk_mp3(pcm_path, ch_map, mp3_path, ffmpeg_bin=ffmpeg_bin, silence_gap_s=silence_gap_s)
-            t0 = time.perf_counter()
 
-            ref_res = None
-            if ref_active and ref_provider is not None and ref_spec is not None:
+            audio_hash = sha256_file(mp3_path) if effective_cache is not None else ""
+            primary_cache_key = (
+                _asr_chunk_cache_key(audio_hash, spec, stt_options) if effective_cache is not None else ""
+            )
+            ref_cache_key = (
+                _asr_chunk_cache_key(audio_hash, ref_spec, stt_options)
+                if (effective_cache is not None and ref_active and ref_spec is not None)
+                else ""
+            )
+
+            res: TranscribeChunkResult | None = None
+            ref_res: TranscribeChunkResult | None = None
+            primary_hit = False
+            ref_hit = False
+
+            if effective_cache is not None:
+                cached_primary = effective_cache.get("asr", primary_cache_key)
+                if cached_primary is not None:
+                    res = _deserialize_chunk_result(cached_primary)
+                    primary_hit = res is not None
+                if ref_active and ref_cache_key:
+                    cached_ref = effective_cache.get("asr", ref_cache_key)
+                    if cached_ref is not None:
+                        ref_res = _deserialize_chunk_result(cached_ref)
+                        ref_hit = ref_res is not None
+
+            need_primary = res is None
+            need_ref = bool(ref_active and ref_provider is not None and ref_spec is not None and ref_res is None)
+
+            if need_primary or need_ref:
+                upload_targets: list[str] = []
+                if need_primary:
+                    upload_targets.append(f"{spec.provider} ({spec.model})")
+                if need_ref and ref_spec is not None:
+                    upload_targets.append(f"{ref_spec.provider} ({ref_spec.model})")
+                print(
+                    f"  -> [分段 {idx}/{len(chunks)}] 正在上传音频至 {' + '.join(upload_targets)}...",
+                    flush=True,
+                )
+
+            t0 = time.perf_counter()
+            if need_primary and need_ref and ref_provider is not None and ref_spec is not None:
                 with ThreadPoolExecutor(max_workers=2) as pool:
                     fut_primary = pool.submit(
                         provider.transcribe_chunk,
@@ -427,15 +525,55 @@ def transcribe_media_pair(
                         )
                         ref_active = False
             else:
-                res = provider.transcribe_chunk(
-                    mp3_path,
-                    model=spec.model,
-                    options=stt_options,
-                    max_retries=max_retries,
-                    progress_fn=lambda msg: print(msg, flush=True),
+                if need_primary:
+                    res = provider.transcribe_chunk(
+                        mp3_path,
+                        model=spec.model,
+                        options=stt_options,
+                        max_retries=max_retries,
+                        progress_fn=lambda msg: print(msg, flush=True),
+                    )
+                if need_ref and ref_provider is not None and ref_spec is not None:
+                    try:
+                        ref_res = ref_provider.transcribe_chunk(
+                            mp3_path,
+                            model=ref_spec.model,
+                            options=stt_options,
+                            max_retries=max_retries,
+                            progress_fn=lambda msg: print(msg, flush=True),
+                        )
+                    except Exception as ref_exc:
+                        print(
+                            f"  -> [警告] 参考 ASR ({ref_spec.provider}/{ref_spec.model}) 分段 {idx} 失败，"
+                            f"本轮后续分段降级为单轨: {ref_exc}",
+                            flush=True,
+                        )
+                        ref_active = False
+
+            assert res is not None
+            elapsed = round(time.perf_counter() - t0, 2)
+
+            if effective_cache is not None and not primary_hit and res.words:
+                effective_cache.set(
+                    "asr",
+                    primary_cache_key,
+                    _serialize_chunk_result(res),
+                    meta={"provider": spec.provider, "model": spec.model},
+                )
+            if (
+                effective_cache is not None
+                and ref_res is not None
+                and not ref_hit
+                and ref_res.words
+                and ref_spec is not None
+            ):
+                effective_cache.set(
+                    "asr",
+                    ref_cache_key,
+                    _serialize_chunk_result(ref_res),
+                    meta={"provider": ref_spec.provider, "model": ref_spec.model},
                 )
 
-            elapsed = round(time.perf_counter() - t0, 2)
             words = map_transcribed_words_to_original(res.words, ch_map)
             total_words += len(words)
             chunk_cues = group_words_to_cues(words)
@@ -447,11 +585,18 @@ def transcribe_media_pair(
                     truncate=(written_cues == 0),
                 )
             usage_part = f" | {res.usage_summary}" if res.usage_summary else ""
-            print(
-                f"  -> [分段 {idx}/{len(chunks)} 主轨完成] 耗时 {elapsed}s | 词数 {len(words)} | "
-                f"已实时写入 {out_srt.name} (累计 {written_cues} 条){usage_part}",
-                flush=True,
-            )
+            if primary_hit:
+                print(
+                    f"  -> [分段 {idx}/{len(chunks)} 主轨缓存命中] 词数 {len(words)} | "
+                    f"已实时写入 {out_srt.name} (累计 {written_cues} 条) [cache]",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"  -> [分段 {idx}/{len(chunks)} 主轨完成] 耗时 {elapsed}s | 词数 {len(words)} | "
+                    f"已实时写入 {out_srt.name} (累计 {written_cues} 条){usage_part}",
+                    flush=True,
+                )
 
             if ref_res is not None and ref_out_srt is not None:
                 ref_words = map_transcribed_words_to_original(ref_res.words, ch_map)
@@ -465,11 +610,18 @@ def transcribe_media_pair(
                         truncate=(ref_written_cues == 0),
                     )
                 ref_usage = f" | {ref_res.usage_summary}" if ref_res.usage_summary else ""
-                print(
-                    f"  -> [分段 {idx}/{len(chunks)} 参考轨完成] 词数 {len(ref_words)} | "
-                    f"已实时写入 {ref_out_srt.name} (累计 {ref_written_cues} 条){ref_usage}",
-                    flush=True,
-                )
+                if ref_hit:
+                    print(
+                        f"  -> [分段 {idx}/{len(chunks)} 参考轨缓存命中] 词数 {len(ref_words)} | "
+                        f"已实时写入 {ref_out_srt.name} (累计 {ref_written_cues} 条) [cache]",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"  -> [分段 {idx}/{len(chunks)} 参考轨完成] 词数 {len(ref_words)} | "
+                        f"已实时写入 {ref_out_srt.name} (累计 {ref_written_cues} 条){ref_usage}",
+                        flush=True,
+                    )
 
         print(f"[4/4] 原语字幕已生成: {out_srt}（共 {total_words} 词 / {written_cues} 条 SRT）", flush=True)
         final_ref_srt: Path | None = None
@@ -504,6 +656,8 @@ def transcribe_media(
     diarize_override: bool | None = None,
     no_verbatim_override: bool | None = None,
     numbers_format_override: str | None = None,
+    use_cache_override: bool | None = None,
+    cache: ResultCache | None = None,
 ) -> Path | None:
     """Transcribe a video/audio file to an original-language SRT file; returns output path or None if silent."""
     primary_srt, _ = transcribe_media_pair(
@@ -521,6 +675,8 @@ def transcribe_media(
         diarize_override=diarize_override,
         no_verbatim_override=no_verbatim_override,
         numbers_format_override=numbers_format_override,
+        use_cache_override=use_cache_override,
+        cache=cache,
     )
     return primary_srt
 
@@ -545,6 +701,7 @@ def run_transcript_cli(
     diarize_override: bool | None = None,
     no_verbatim_override: bool | None = None,
     numbers_format_override: str | None = None,
+    use_cache_override: bool | None = None,
 ) -> int:
     try:
         transcribe_media_pair(
@@ -566,6 +723,7 @@ def run_transcript_cli(
             diarize_override=diarize_override,
             no_verbatim_override=no_verbatim_override,
             numbers_format_override=numbers_format_override,
+            use_cache_override=use_cache_override,
         )
         return 0
     except Exception as exc:

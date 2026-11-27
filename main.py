@@ -7,10 +7,12 @@ import shutil
 import sys
 from pathlib import Path
 
+from src.cache import ResultCache
 from src.config import (
     DEFAULT_CONFIG_PATH,
     get_app_root,
     get_bundle_root,
+    get_cache_config,
     get_providers_config,
     is_frozen,
     load_engine_config,
@@ -152,7 +154,7 @@ def _add_translate_args(p: argparse.ArgumentParser) -> None:
         "--batch-size",
         type=int,
         default=None,
-        help="覆盖每批翻译条数上限（默认 280，自动均匀切分）",
+        help="覆盖每批翻译条数上限（默认 280，按静音间隙智能切分）",
     )
     p.add_argument(
         "--auto-context",
@@ -173,6 +175,26 @@ def _add_translate_args(p: argparse.ArgumentParser) -> None:
         action="store_false",
         default=None,
         help="关闭翻译后 CPS 读速/最短驻留时间轴打磨（默认开启）",
+    )
+    p.add_argument(
+        "--no-repair-missing",
+        dest="repair_missing",
+        action="store_false",
+        default=None,
+        help="关闭漏译/异常合并 ID 自动 1 轮精确补译（默认开启）",
+    )
+    p.add_argument(
+        "--max-line-chars",
+        type=float,
+        default=None,
+        help="覆盖译文视觉平衡折行阈值（等效中文字符数，默认 24；设为 0 关闭折行）",
+    )
+    p.add_argument(
+        "--log-llm",
+        dest="log_llm",
+        action="store_true",
+        default=None,
+        help="开启完整 LLM 请求与响应轮转 JSONL 调试日志",
     )
 
 
@@ -213,6 +235,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="覆盖语音转写模型（默认 elevenlabs/scribe_v3；支持 provider/model 前缀，如 gemini/gemini-3.5-transcribe）",
     )
     _add_transcript_common_args(tr_parser)
+    tr_parser.add_argument(
+        "--no-cache",
+        dest="use_cache",
+        action="store_false",
+        default=None,
+        help="临时禁用本地 SQLite 内容哈希缓存（默认开启）",
+    )
     tr_parser.add_argument("-o", "--output", default=None, help="输出原语 .srt 路径（默认同目录同名 .srt）")
     tr_parser.add_argument("--ref-output", default=None, help="可选：双 ASR 参考轨原语 .srt 保存路径（默认 <output>_ref.srt）")
 
@@ -245,6 +274,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="可选：第二份独立 ASR 原语 .srt 参考轨（用于双 ASR 交叉纠偏，例如 ElevenLabs 主轨 + Gemini 参考轨）",
     )
     _add_translate_args(tl_parser)
+    tl_parser.add_argument(
+        "--no-cache",
+        dest="use_cache",
+        action="store_false",
+        default=None,
+        help="临时禁用本地 SQLite 内容哈希缓存（默认开启）",
+    )
     tl_parser.add_argument("-o", "--output", default=None, help="输出翻译后 .srt 路径")
 
     # 3. run (one-shot transcript -> translate)
@@ -283,6 +319,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="覆盖翻译模型或逗号分隔降级链（如 openai/gpt-6.2-sol,gemini/gemini-4-hydrogen）",
     )
     _add_translate_args(run_parser)
+    run_parser.add_argument(
+        "--no-cache",
+        dest="use_cache",
+        action="store_false",
+        default=None,
+        help="临时禁用本地 SQLite 内容哈希缓存（默认开启）",
+    )
     run_parser.add_argument("--srt-output", default=None, help="可选：中间原语 .srt 保存路径")
     run_parser.add_argument("--ref-srt-output", default=None, help="可选：双 ASR 参考轨中间 .srt 保存路径")
     run_parser.add_argument("-o", "--output", default=None, help="可选：最终翻译 .srt 保存路径")
@@ -299,7 +342,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="列出所有内置 Profile 及其可配置的上下文变量",
     )
 
-    # 6. doctor
+    # 6. cache
+    cache_parser = subparsers.add_parser(
+        "cache",
+        help="查看或清理本地 SQLite 内容哈希缓存（ASR / 翻译 / Pass 0）",
+    )
+    cache_parser.add_argument(
+        "action",
+        nargs="?",
+        choices=["stats", "clear"],
+        default="stats",
+        help="操作类型：stats（默认，查看缓存统计）或 clear（清理缓存）",
+    )
+    cache_parser.add_argument(
+        "--namespace",
+        choices=["all", "asr", "translate", "pass0"],
+        default="all",
+        help="clear 时指定清理范围（默认 all）",
+    )
+
+    # 7. doctor
     doc_parser = subparsers.add_parser(
         "doctor",
         help="检查本地运行环境（FFmpeg、Silero VAD ONNX、Profile 与多厂商 API Key 配置状态）",
@@ -311,6 +373,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     return parser
+
+
+def run_cache(defaults_path: Path, *, action: str = "stats", namespace: str = "all") -> int:
+    defaults = load_engine_config(defaults_path)
+    cfg = get_cache_config(defaults)
+    cache = ResultCache(cfg["path"], enabled=True, ttl_days=float(cfg["ttl_days"]))
+    if action == "clear":
+        removed = cache.clear(None if namespace == "all" else namespace)
+        scope = "全部" if namespace == "all" else namespace
+        print(f"已清理本地缓存（范围: {scope}，删除 {removed} 条记录）: {cfg['path']}", flush=True)
+        return 0
+    info = cache.stats()
+    size_kb = info["size_bytes"] / 1024.0
+    size_str = f"{size_kb / 1024.0:.2f} MB" if size_kb >= 1024.0 else f"{size_kb:.1f} KB"
+    ns_parts = ", ".join(f"{k}={v}" for k, v in info["by_namespace"].items()) or "空"
+    print("=== [AutoSub 本地缓存状态] ===", flush=True)
+    print(f"缓存开关: {'开启' if cfg['enabled'] else '关闭'} | TTL: {cfg['ttl_days']:g} 天", flush=True)
+    print(f"数据库路径: {info['path']}", flush=True)
+    print(f"缓存条目: 共 {info['total']} 条（{ns_parts}）| 占用空间: {size_str}", flush=True)
+    return 0
 
 
 def run_providers(defaults_path: Path) -> int:
@@ -354,6 +436,7 @@ def run_doctor(defaults_path: Path, *, strict_bundle: bool = False) -> int:
     defaults = load_engine_config(defaults_path)
     tools_cfg = defaults.get("tools") or {}
     providers_cfg = get_providers_config(defaults)
+    cache_cfg = get_cache_config(defaults)
 
     ffmpeg_resolved = resolve_binary(str(tools_cfg.get("ffmpeg_bin") or ""), ["ffmpeg.exe", "ffmpeg"])
     ffmpeg_ok = Path(ffmpeg_resolved).is_file() or shutil.which(ffmpeg_resolved) is not None
@@ -377,6 +460,10 @@ def run_doctor(defaults_path: Path, *, strict_bundle: bool = False) -> int:
         flush=True,
     )
     print(f"内置 Profile: {', '.join(n for n, _, _ in profiles) or '未找到'}", flush=True)
+    print(
+        f"本地缓存: {'已启用' if cache_cfg['enabled'] else '已关闭'} ({cache_cfg['path']})",
+        flush=True,
+    )
     print(f"ElevenLabs API Key (默认转录): {'已配置' if elevenlabs_ok else '未配置（请设置 ELEVENLABS_API_KEY 或创建 .env）'}", flush=True)
     print(f"Gemini API Key (默认翻译): {'已配置' if gemini_ok else '未配置（请设置 GEMINI_API_KEY 或创建 .env）'}", flush=True)
     print("其他厂商 API Key 状态:", flush=True)
@@ -407,6 +494,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "providers":
         return run_providers(defaults_path)
+
+    if args.command == "cache":
+        return run_cache(defaults_path, action=args.action, namespace=args.namespace)
 
     if args.command == "profiles":
         items = list_profiles()
@@ -440,6 +530,7 @@ def main(argv: list[str] | None = None) -> int:
             diarize_override=args.diarize,
             no_verbatim_override=args.no_verbatim,
             numbers_format_override=args.numbers_format,
+            use_cache_override=args.use_cache,
         )
 
     if args.command == "translate":
@@ -458,6 +549,10 @@ def main(argv: list[str] | None = None) -> int:
             auto_context_override=args.auto_context,
             merge_cues_override=args.merge_cues,
             polish_timing_override=args.polish_timing,
+            repair_missing_override=args.repair_missing,
+            max_line_chars_override=args.max_line_chars,
+            use_cache_override=args.use_cache,
+            log_llm_override=args.log_llm,
             ref_srt_path=Path(args.ref_srt).resolve() if args.ref_srt else None,
             output_path=Path(args.output).resolve() if args.output else None,
         )
@@ -483,6 +578,7 @@ def main(argv: list[str] | None = None) -> int:
                 diarize_override=args.diarize,
                 no_verbatim_override=args.no_verbatim,
                 numbers_format_override=args.numbers_format,
+                use_cache_override=args.use_cache,
             )
             if raw_srt is None:
                 return 0
@@ -501,6 +597,10 @@ def main(argv: list[str] | None = None) -> int:
                 auto_context_override=args.auto_context,
                 merge_cues_override=args.merge_cues,
                 polish_timing_override=args.polish_timing,
+                repair_missing_override=args.repair_missing,
+                max_line_chars_override=args.max_line_chars,
+                use_cache_override=args.use_cache,
+                log_llm_override=args.log_llm,
                 ref_srt_path=ref_srt,
                 output_path=Path(args.output).resolve() if args.output else None,
             )

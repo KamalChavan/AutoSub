@@ -70,6 +70,7 @@ a = Analysis(
     hiddenimports=[
         "yaml",
         "certifi",
+        "sqlite3",
     ],
     hookspath=[],
     hooksconfig={},

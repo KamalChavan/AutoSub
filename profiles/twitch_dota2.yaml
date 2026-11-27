@@ -49,6 +49,7 @@ translate:
        - For each kept `id`, output either `[id, "translated"]` (when original text needs no correction) OR `[id, "translated", "corrected_src"]` (ONLY when you fixed an obvious phonetic ASR error in the original text; NEVER merge neighboring sentences into `corrected_src`).
        - Strip leading/internal empty filler words ("короче / типа / ну / вот / э / блин / like / uh / you know" -> do NOT translate into "呃/靠/就是说" unless strongly emotional).
        - Distinguish lane creeps (线上小兵/小兵) vs neutral creeps (中立野怪/野怪) vs ancients (远古野) vs camps (野点) by gameplay context.
+       - Maintain cross-subtitle coherence: when a thought spans adjacent cues without being merged, keep clause flow, pronouns, and esports register natural across subtitle boundaries rather than translating word-by-word.
     {glossary_section}
 
     ### Output Format (Compact JSON Only)
