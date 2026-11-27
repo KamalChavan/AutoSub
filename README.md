@@ -21,6 +21,10 @@
    - **OpenAI（`openai/gpt-6.2-sol`、`openai/gpt-6-luna` 等）**：默认走 `/v1/responses`（将固定系统提示置为 `input` 首条 `developer` 消息以命中 GPT-6.2 Prompt Caching，推理深度默认 `low`），也支持切换 `/v1/chat/completions`。
    - **OpenAI 兼容网关（`openai_compatible`）**：支持 DeepSeek、OpenRouter、Groq、DashScope、Ollama、vLLM 等任意自定义厂商别名。
    - 支持跨厂商混排降级（如 `openai/gpt-6.2-sol,gemini/gemini-4-hydrogen`）：遇到 `503` 高负载时当前模型原地尝试 3 次再向下切换；遇到 `429` / `402` 额度耗尽时当轮直接熔断跳过。
+5. **高质量字幕增强管线（双 ASR 交叉仲裁 + Pass 0 上下文 + 智能排轴）**
+   - **双 ASR 交叉仲裁**：可在 `config/defaults.yaml` 中直接开关 `transcript.ref_enabled: true`（一次 VAD 切片，并行调用主轨与参考轨如 `elevenlabs/scribe_v3` + `gemini-3.5-transcribe`），经拼写微差降噪后将有效分歧作为 `alt_asr` 喂给翻译模型仲裁纠偏。
+   - **Pass 0 全片上下文分析（`--auto-context`）**：分批翻译前通读全片提取概要、人名/外号、出场实体与高频 ASR 错词，注入固定前缀供所有批次缓存复用。
+   - **语义碎句合并 + 确定性 CPS 排轴**：前端吸收 1~2 词孤儿尾词并拦截单字异常拉伸；翻译阶段支持短停顿碎句语义合并（时间戳严格锚定原词边界）；落盘前自动执行最短驻留、CPS 读速延展与微间隙桥接（零时间轴重叠）。
 
 ---
 
@@ -142,14 +146,32 @@ autosub translate "elevenlabs.srt" \
   --reasoning-effort medium \
   --auto-context
 
-# 或在 config/defaults.yaml 中直接常开双 ASR（一次 VAD 切片，并行转录主+参考轨并自动仲裁）：
-#   transcript:
-#     provider: "elevenlabs"
-#     model: "scribe_v3"
-#     ref_enabled: true
-#     ref_model: "gemini-3.5-transcribe"
-# 配置好后一条 `autosub run vod.mp4 -p twitch_dota2 --auto-context` 即可全自动跑完（可用 `--no-ref-transcript` 临时关闭）。
+# 高阶：一条命令临时开启双 ASR 并行转录 + 仲裁翻译
+autosub run "P02_死灵龙.mp4" \
+  --profile twitch_dota2 \
+  --transcript-model elevenlabs/scribe_v3 \
+  --ref-transcript-model gemini-3.5-transcribe \
+  --translate-model openai/gpt-6.2-sol \
+  --reasoning-effort medium \
+  --auto-context
 ```
+
+如果希望**默认常开**双 ASR 与 Pass 0 全片上下文，可直接修改 `config/defaults.yaml`：
+
+```yaml
+transcript:
+  provider: "elevenlabs"
+  model: "scribe_v3"
+  ref_enabled: true
+  ref_model: "gemini-3.5-transcribe"
+
+translate:
+  auto_context: true
+  merge_cues: true
+  polish_timing: true
+```
+
+配置好后只需运行 `autosub run "vod.mp4" -p twitch_dota2` 即可全自动跑完（需要单次临时关闭双 ASR 时追加 `--no-ref-transcript`）。
 
 > 提示：
 > - ElevenLabs `keyterms`（`--keyterm`）会增加 `+25%` 计费，默认关闭，仅在人名/专业词识别困难时按需传入。
@@ -166,13 +188,14 @@ autosub transcript "P02_死灵龙.mp4" --profile twitch_dota2
 autosub translate "P02_死灵龙.srt" --profile twitch_dota2 --var hero="死灵龙" --var streamer="4oapm"
 ```
 
-> `--var hero` 和 `--var streamer` 均为选填，不传会由模型从对话推断；但传入本局英雄和主播名可明显提升 ASR 同音纠偏与技能语境翻译准确度。
+> `--var hero` 和 `--var streamer` 均为选填，不传会由模型从对话推断；但传入本局英雄和主播名（或开启 `--auto-context`）可明显提升 ASR 同音纠偏与技能语境翻译准确度。
 
 ### 5. 自定义任意领域的 Profile 与术语表
 
 复制安装目录下的 `profiles/default.yaml` 到任意位置（例如 `my_podcast.yaml`），按需修改：
 - `target_language` / `source_language_hint` / `bilingual` / `bilingual_order`
-- `transcript.language_code` / `transcript.secondary_language_codes`（用于 ElevenLabs Scribe v3 / Whisper）
+- `transcript.language_code` / `transcript.secondary_language_codes` / `transcript.ref_enabled` / `transcript.ref_model`
+- `translate.auto_context` / `translate.merge_cues` / `translate.polish_timing`
 - `translate.glossaries`：指向一份或多份术语表 YAML（格式：`分类名 -> {目标词: [原语别名1, 别名2]}`）
 - `translate.default_vars`：自定义上下文变量默认值
 - `translate.prompt_template`：使用 `{变量名}` 与 `{glossary_section}`（JSON 示例里的花括号写 `{{` / `}}`）
