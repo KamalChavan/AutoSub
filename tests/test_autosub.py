@@ -1723,6 +1723,11 @@ class TestReliabilityCacheAndWrapping(unittest.TestCase):
         self.assertEqual(lines[1], "等死灵龙把大招和死灵书全部转好再上。")
         self.assertTrue(all(_effective_display_chars(ln) <= 24 for ln in lines))
 
+        # Clause comma within ±5 CJK chars of midpoint beats breaking mid-phrase
+        clause_zh = "来来来，兄弟们，帮我带个会驱散的野怪过来，求你们了。"
+        c_lines = wrap_subtitle_line(clause_zh, max_line_chars=24).splitlines()
+        self.assertEqual(c_lines, ["来来来，兄弟们，", "帮我带个会驱散的野怪过来，求你们了。"])
+
         # Long Chinese line without punctuation splits visually balanced (not 24 + 5)
         no_punct = "我们中路直接抱团推进拿下二塔然后顺手控掉对面的魔方和经验符"
         w_lines = wrap_subtitle_line(no_punct, max_line_chars=24).splitlines()

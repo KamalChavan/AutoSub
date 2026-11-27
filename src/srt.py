@@ -343,9 +343,9 @@ def _wrap_single_line(text: str, max_line_chars: float) -> str:
         tok_text = tokens[end_j - 1][0]
         tail = tok_text[-2:] if len(tok_text) >= 2 else tok_text
         if any(ch in _STRONG_BREAK_PUNCT for ch in tail):
-            return -36.0
+            return -75.0
         if any(ch in _MEDIUM_BREAK_PUNCT for ch in tail):
-            return -25.0
+            return -55.0
         if tokens[end_j][1]:
             return -3.0
         return 0.0
