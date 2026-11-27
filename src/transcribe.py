@@ -7,6 +7,7 @@ timestamps back to the original timeline, and writes `.srt` incrementally after 
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import tempfile
 import time
@@ -22,6 +23,7 @@ from src.config import (
 from src.http_client import delete_url, upload_resumable_file
 from src.profile import load_profile
 from src.providers import (
+    ModelSpec,
     TranscribedWord,
     build_provider_settings,
     create_transcribe_provider,
@@ -146,15 +148,69 @@ def _default_model_for_provider(provider_name: str, protocol: str) -> str:
     return DEFAULT_TRANSCRIBE_MODEL
 
 
-def transcribe_media(
+def resolve_dual_asr_spec(
+    tr_cfg: dict[str, Any],
+    providers_cfg: dict[str, dict[str, Any]],
+    *,
+    primary_spec: ModelSpec,
+    ref_enabled_override: bool | None = None,
+    ref_provider_override: str | None = None,
+    ref_model_override: str | None = None,
+) -> ModelSpec | None:
+    """Resolve optional reference ASR `ModelSpec` from YAML (`transcript.ref_*`) and CLI overrides."""
+    if ref_enabled_override is False:
+        return None
+    enabled = (
+        True
+        if (ref_enabled_override is True or ref_model_override or ref_provider_override)
+        else bool(tr_cfg.get("ref_enabled", False))
+    )
+    if not enabled:
+        return None
+
+    cfg_ref_provider = str(tr_cfg.get("ref_provider") or "").strip().lower()
+    raw_ref_model = str(ref_model_override or tr_cfg.get("ref_model") or "").strip()
+    eff_ref_provider = (ref_provider_override or cfg_ref_provider).strip().lower()
+
+    if not raw_ref_model and eff_ref_provider:
+        proto = str((providers_cfg.get(eff_ref_provider) or {}).get("protocol") or eff_ref_provider).strip().lower()
+        raw_ref_model = _default_model_for_provider(eff_ref_provider, proto)
+
+    if not raw_ref_model:
+        raise ValueError(
+            "已启用双 ASR (transcript.ref_enabled=true)，但未配置参考模型；"
+            "请在 config/defaults.yaml 中填写 `transcript.ref_model`（例如 `gemini-3.5-transcribe`）"
+            "或通过 `--ref-model` 指定"
+        )
+
+    ref_spec = parse_model_spec(
+        raw_ref_model,
+        default_provider=eff_ref_provider or "gemini",
+        known_providers=providers_cfg,
+        provider_override=ref_provider_override or (cfg_ref_provider or None),
+    )
+    if ref_spec.provider == primary_spec.provider and ref_spec.model == primary_spec.model:
+        print(
+            f"[提示] 双 ASR 参考轨 ({ref_spec.provider}/{ref_spec.model}) 与主转录模型相同，本轮自动跳过重复转录。",
+            flush=True,
+        )
+        return None
+    return ref_spec
+
+
+def transcribe_media_pair(
     input_path: Path,
     *,
     defaults_path: Path = DEFAULT_CONFIG_PATH,
     profile_name: str | None = None,
     output_path: Path | None = None,
+    ref_output_path: Path | None = None,
     vad_override: str | None = None,
     provider_override: str | None = None,
     model_override: str | None = None,
+    ref_enabled_override: bool | None = None,
+    ref_provider_override: str | None = None,
+    ref_model_override: str | None = None,
     max_chunk_seconds_override: float | None = None,
     language_override: str | None = None,
     secondary_languages_override: list[str] | None = None,
@@ -162,8 +218,12 @@ def transcribe_media(
     diarize_override: bool | None = None,
     no_verbatim_override: bool | None = None,
     numbers_format_override: str | None = None,
-) -> Path | None:
-    """Transcribe a video/audio file to an original-language SRT file; returns output path or None if silent."""
+) -> tuple[Path | None, Path | None]:
+    """Transcribe media to primary SRT (and optional reference ASR SRT when dual-ASR is enabled).
+
+    Runs FFmpeg decode, Silero VAD, and MP3 chunk encoding ONCE, then dispatches primary + reference
+    providers concurrently per chunk. Returns `(primary_srt_path, ref_srt_path_or_None)`.
+    """
     if not input_path.is_file():
         raise FileNotFoundError(f"找不到输入媒体文件: {input_path}")
 
@@ -195,12 +255,26 @@ def transcribe_media(
     settings = build_provider_settings(spec.provider, defaults, require_api_key=True)
     provider = create_transcribe_provider(settings)
 
+    ref_spec = resolve_dual_asr_spec(
+        tr_cfg,
+        providers_cfg,
+        primary_spec=spec,
+        ref_enabled_override=ref_enabled_override,
+        ref_provider_override=ref_provider_override,
+        ref_model_override=ref_model_override,
+    )
+    ref_provider = None
+    if ref_spec is not None:
+        ref_settings = build_provider_settings(ref_spec.provider, defaults, require_api_key=True)
+        ref_provider = create_transcribe_provider(ref_settings)
+
     ffmpeg_bin = resolve_binary(str(tools_cfg.get("ffmpeg_bin") or ""), ["ffmpeg", "ffmpeg.exe"])
     vad_mode = str(vad_override or tr_cfg.get("vad_mode") or "silero_onnx").strip().lower()
     max_chunk_s = float(max_chunk_seconds_override or tr_cfg.get("max_chunk_seconds", 1680))
-    if provider.max_chunk_bytes is not None:
-        max_by_size = max(30.0, provider.max_chunk_bytes / _MP3_48K_BYTES_PER_SEC_ESTIMATE)
-        max_chunk_s = min(max_chunk_s, max_by_size)
+    for prov in (provider, ref_provider):
+        if prov is not None and prov.max_chunk_bytes is not None:
+            max_by_size = max(30.0, prov.max_chunk_bytes / _MP3_48K_BYTES_PER_SEC_ESTIMATE)
+            max_chunk_s = min(max_chunk_s, max_by_size)
     silence_gap_s = float(tr_cfg.get("vad_silence_gap_s", 0.50))
     max_retries = int(tr_cfg.get("max_retries", 6))
 
@@ -276,34 +350,87 @@ def transcribe_media(
 
         if not segments:
             print("[警告] 未检测到有效语音片段，跳过转写。", flush=True)
-            return None
+            return None, None
 
         chunks = pack_segments_into_chunks(segments, max_chunk_seconds=max_chunk_s, silence_gap_s=silence_gap_s)
         compact_total = sum(float(ch[-1]["compact_end"]) for ch in chunks)
         model_label = f"{spec.provider}/{spec.model}"
+        dual_desc = (
+            f" + 参考轨 {ref_spec.provider}/{ref_spec.model}（双 ASR 并行）"
+            if ref_spec is not None and ref_provider is not None
+            else ""
+        )
         print(
             f"[3/4] 原始时长 {total_dur/60:.1f} 分钟 -> 压缩后 {compact_total/60:.1f} 分钟 "
-            f"(节省 {max(0.0, 1 - compact_total/max(1.0, total_dur)):.1%})，共分 {len(chunks)} 段调用 {model_label}...",
+            f"(节省 {max(0.0, 1 - compact_total/max(1.0, total_dur)):.1%})，共分 {len(chunks)} 段调用 {model_label}{dual_desc}...",
             flush=True,
         )
 
         out_srt = output_path or input_path.with_suffix(".srt")
         out_srt.parent.mkdir(parents=True, exist_ok=True)
         out_srt.write_text("", encoding="utf-8")
+
+        ref_out_srt: Path | None = None
+        if ref_spec is not None and ref_provider is not None:
+            ref_out_srt = ref_output_path or out_srt.with_name(f"{out_srt.stem}_ref.srt")
+            ref_out_srt.parent.mkdir(parents=True, exist_ok=True)
+            ref_out_srt.write_text("", encoding="utf-8")
+
         total_words = 0
         written_cues = 0
+        ref_total_words = 0
+        ref_written_cues = 0
+        ref_active = ref_provider is not None and ref_spec is not None and ref_out_srt is not None
+
         for idx, ch_map in enumerate(chunks, 1):
             mp3_path = tmp_dir / f"chunk_{idx:02d}.mp3"
-            print(f"  -> [分段 {idx}/{len(chunks)}] 正在编码并上传音频至 {spec.provider} ({spec.model})...", flush=True)
+            target_desc = (
+                f"{spec.provider} ({spec.model}) + {ref_spec.provider} ({ref_spec.model})"
+                if ref_active and ref_spec is not None
+                else f"{spec.provider} ({spec.model})"
+            )
+            print(f"  -> [分段 {idx}/{len(chunks)}] 正在编码并上传音频至 {target_desc}...", flush=True)
             render_chunk_mp3(pcm_path, ch_map, mp3_path, ffmpeg_bin=ffmpeg_bin, silence_gap_s=silence_gap_s)
             t0 = time.perf_counter()
-            res = provider.transcribe_chunk(
-                mp3_path,
-                model=spec.model,
-                options=stt_options,
-                max_retries=max_retries,
-                progress_fn=lambda msg: print(msg, flush=True),
-            )
+
+            ref_res = None
+            if ref_active and ref_provider is not None and ref_spec is not None:
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    fut_primary = pool.submit(
+                        provider.transcribe_chunk,
+                        mp3_path,
+                        model=spec.model,
+                        options=stt_options,
+                        max_retries=max_retries,
+                        progress_fn=lambda msg: print(msg, flush=True),
+                    )
+                    fut_ref = pool.submit(
+                        ref_provider.transcribe_chunk,
+                        mp3_path,
+                        model=ref_spec.model,
+                        options=stt_options,
+                        max_retries=max_retries,
+                        progress_fn=lambda msg: print(msg, flush=True),
+                    )
+                    res = fut_primary.result()
+                    try:
+                        ref_res = fut_ref.result()
+                    except Exception as ref_exc:
+                        print(
+                            f"  -> [警告] 参考 ASR ({ref_spec.provider}/{ref_spec.model}) 分段 {idx} 失败，"
+                            f"本轮后续分段降级为单轨: {ref_exc}",
+                            flush=True,
+                        )
+                        ref_active = False
+            else:
+                res = provider.transcribe_chunk(
+                    mp3_path,
+                    model=spec.model,
+                    options=stt_options,
+                    max_retries=max_retries,
+                    progress_fn=lambda msg: print(msg, flush=True),
+                )
+
             elapsed = round(time.perf_counter() - t0, 2)
             words = map_transcribed_words_to_original(res.words, ch_map)
             total_words += len(words)
@@ -317,16 +444,47 @@ def transcribe_media(
                 )
             usage_part = f" | {res.usage_summary}" if res.usage_summary else ""
             print(
-                f"  -> [分段 {idx}/{len(chunks)} 完成] 耗时 {elapsed}s | 词数 {len(words)} | "
+                f"  -> [分段 {idx}/{len(chunks)} 主轨完成] 耗时 {elapsed}s | 词数 {len(words)} | "
                 f"已实时写入 {out_srt.name} (累计 {written_cues} 条){usage_part}",
                 flush=True,
             )
 
+            if ref_res is not None and ref_out_srt is not None:
+                ref_words = map_transcribed_words_to_original(ref_res.words, ch_map)
+                ref_total_words += len(ref_words)
+                ref_chunk_cues = group_words_to_cues(ref_words)
+                if ref_chunk_cues:
+                    ref_written_cues = append_srt_cues(
+                        [(c.start, c.end, [c.text]) for c in ref_chunk_cues],
+                        ref_out_srt,
+                        start_index=ref_written_cues + 1,
+                        truncate=(ref_written_cues == 0),
+                    )
+                ref_usage = f" | {ref_res.usage_summary}" if ref_res.usage_summary else ""
+                print(
+                    f"  -> [分段 {idx}/{len(chunks)} 参考轨完成] 词数 {len(ref_words)} | "
+                    f"已实时写入 {ref_out_srt.name} (累计 {ref_written_cues} 条){ref_usage}",
+                    flush=True,
+                )
+
         print(f"[4/4] 原语字幕已生成: {out_srt}（共 {total_words} 词 / {written_cues} 条 SRT）", flush=True)
-        return out_srt
+        final_ref_srt: Path | None = None
+        if ref_out_srt is not None:
+            if ref_written_cues > 0:
+                final_ref_srt = ref_out_srt
+                print(
+                    f"[4/4] 双 ASR 参考轨已生成: {ref_out_srt}（共 {ref_total_words} 词 / {ref_written_cues} 条 SRT）",
+                    flush=True,
+                )
+            else:
+                try:
+                    ref_out_srt.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        return out_srt, final_ref_srt
 
 
-def run_transcript_cli(
+def transcribe_media(
     input_path: Path,
     *,
     defaults_path: Path = DEFAULT_CONFIG_PATH,
@@ -342,16 +500,61 @@ def run_transcript_cli(
     diarize_override: bool | None = None,
     no_verbatim_override: bool | None = None,
     numbers_format_override: str | None = None,
+) -> Path | None:
+    """Transcribe a video/audio file to an original-language SRT file; returns output path or None if silent."""
+    primary_srt, _ = transcribe_media_pair(
+        input_path,
+        defaults_path=defaults_path,
+        profile_name=profile_name,
+        output_path=output_path,
+        vad_override=vad_override,
+        provider_override=provider_override,
+        model_override=model_override,
+        max_chunk_seconds_override=max_chunk_seconds_override,
+        language_override=language_override,
+        secondary_languages_override=secondary_languages_override,
+        keyterms_override=keyterms_override,
+        diarize_override=diarize_override,
+        no_verbatim_override=no_verbatim_override,
+        numbers_format_override=numbers_format_override,
+    )
+    return primary_srt
+
+
+def run_transcript_cli(
+    input_path: Path,
+    *,
+    defaults_path: Path = DEFAULT_CONFIG_PATH,
+    profile_name: str | None = None,
+    output_path: Path | None = None,
+    ref_output_path: Path | None = None,
+    vad_override: str | None = None,
+    provider_override: str | None = None,
+    model_override: str | None = None,
+    ref_enabled_override: bool | None = None,
+    ref_provider_override: str | None = None,
+    ref_model_override: str | None = None,
+    max_chunk_seconds_override: float | None = None,
+    language_override: str | None = None,
+    secondary_languages_override: list[str] | None = None,
+    keyterms_override: list[str] | None = None,
+    diarize_override: bool | None = None,
+    no_verbatim_override: bool | None = None,
+    numbers_format_override: str | None = None,
 ) -> int:
     try:
-        transcribe_media(
+        transcribe_media_pair(
             input_path,
             defaults_path=defaults_path,
             profile_name=profile_name,
             output_path=output_path,
+            ref_output_path=ref_output_path,
             vad_override=vad_override,
             provider_override=provider_override,
             model_override=model_override,
+            ref_enabled_override=ref_enabled_override,
+            ref_provider_override=ref_provider_override,
+            ref_model_override=ref_model_override,
             max_chunk_seconds_override=max_chunk_seconds_override,
             language_override=language_override,
             secondary_languages_override=secondary_languages_override,

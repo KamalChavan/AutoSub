@@ -70,7 +70,13 @@ from src.srt import (
     polish_srt_timing,
     write_srt,
 )
-from src.transcribe import call_gemini_transcribe, extract_words_from_interaction, map_transcribed_words_to_original
+from src.transcribe import (
+    call_gemini_transcribe,
+    extract_words_from_interaction,
+    map_transcribed_words_to_original,
+    resolve_dual_asr_spec,
+    transcribe_media_pair,
+)
 from src.translate import (
     DEFAULT_TRANSLATE_MODELS,
     SubtitleTranslator,
@@ -1199,6 +1205,142 @@ class TestPhaseOneQualityUpgrades(unittest.TestCase):
         dota = load_profile("twitch_dota2")
         self.assertIn("in-game announcer", dota.prompt_template)
         self.assertIn("Prepare for battle.", dota.prompt_template)
+
+        g = load_glossary(PROJECT_ROOT / "glossaries" / "dota2_ru_en_zh.yaml")
+        self.assertIn("英雄栏/英雄面板", g["mechanics_and_slang"])
+        self.assertIn("KDA", g["mechanics_and_slang"])
+        self.assertIn("后期能力/成长性", g["mechanics_and_slang"])
+        self.assertIn("屏蔽", g["mechanics_and_slang"])
+        self.assertIn("开小号/炸鱼", g["mechanics_and_slang"])
+
+    def test_align_reference_srt_denoises_spelling_while_keeping_real_fixes(self) -> None:
+        primary = [
+            SrtCue(1, 1.0, 2.0, "Да ты пиздишь, что у него такой винрейт хуевый."),
+            SrtCue(2, 5.0, 6.0, "Баттерфляй."),
+            SrtCue(3, 10.0, 11.0, "Блять, трипа не добил."),
+            SrtCue(4, 15.0, 16.5, "Лаврик ебаный рекорд получает."),
+            SrtCue(5, 20.0, 22.0, "Что такое надо за, блядь, бегать, я не понимаю."),
+        ]
+        ref = [
+            SrtCue(1, 1.0, 2.0, "Да ты пиздишь, что у него такой винрейт хуёвый."),
+            SrtCue(2, 5.0, 6.0, "Батерфляй."),
+            SrtCue(3, 10.0, 11.0, "Блядь, крипа не добил."),
+            SrtCue(4, 15.0, 16.5, "Лаврик ебаный репорт получает."),
+            SrtCue(5, 20.0, 22.0, "Что такое на дазле, блядь, бегать? Я не понимаю."),
+        ]
+        aligned = align_reference_srt(primary, ref)
+        # Pure spelling/ё/doubled-letter diffs dropped
+        self.assertNotIn(1, aligned)
+        self.assertNotIn(2, aligned)
+        # Genuine lexical fixes preserved 100%
+        self.assertIn(3, aligned)
+        self.assertIn(4, aligned)
+        self.assertIn(5, aligned)
+
+    def test_yaml_dual_asr_resolution_pipeline_and_cli_flags(self) -> None:
+        providers_cfg = get_providers_config({})
+        primary = ModelSpec(provider="elevenlabs", model="scribe_v3")
+
+        # 1. Disabled by default
+        self.assertIsNone(resolve_dual_asr_spec({"ref_enabled": False}, providers_cfg, primary_spec=primary))
+
+        # 2. Enabled in YAML with ref_model -> auto-infers gemini provider
+        spec = resolve_dual_asr_spec(
+            {"ref_enabled": True, "ref_model": "gemini-3.5-transcribe"},
+            providers_cfg,
+            primary_spec=primary,
+        )
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        self.assertEqual((spec.provider, spec.model), ("gemini", "gemini-3.5-transcribe"))
+
+        # 3. CLI --no-ref-transcript disables even when YAML ref_enabled=True
+        self.assertIsNone(
+            resolve_dual_asr_spec(
+                {"ref_enabled": True, "ref_model": "gemini-3.5-transcribe"},
+                providers_cfg,
+                primary_spec=primary,
+                ref_enabled_override=False,
+            )
+        )
+
+        # 4. Duplicate primary == ref skipped cleanly
+        self.assertIsNone(
+            resolve_dual_asr_spec(
+                {"ref_enabled": True, "ref_model": "elevenlabs/scribe_v3"},
+                providers_cfg,
+                primary_spec=primary,
+            )
+        )
+
+        # 5. ref_enabled=True without ref_model raises clear ValueError
+        with self.assertRaises(ValueError):
+            resolve_dual_asr_spec({"ref_enabled": True, "ref_model": ""}, providers_cfg, primary_spec=primary)
+
+        # 6. CLI flags parsing
+        parser = autosub_main.build_parser()
+        a_tr = parser.parse_args([
+            "transcript", "vod.mp4", "--model", "elevenlabs/scribe_v3",
+            "--ref-model", "gemini-3.5-transcribe", "--ref-output", "ref.srt",
+        ])
+        self.assertEqual(a_tr.ref_model, "gemini-3.5-transcribe")
+        self.assertEqual(a_tr.ref_output, "ref.srt")
+
+        a_run = parser.parse_args([
+            "run", "vod.mp4", "--ref-transcript-model", "gemini-3.5-transcribe",
+            "--ref-srt-output", "mid_ref.srt", "--no-ref-transcript",
+        ])
+        self.assertEqual(a_run.ref_model, "gemini-3.5-transcribe")
+        self.assertEqual(a_run.ref_srt_output, "mid_ref.srt")
+        self.assertIs(a_run.ref_enabled, False)
+
+        # 7. End-to-end offline single-VAD dual-ASR pipeline via YAML config
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            cfg_path = d / "defaults.yaml"
+            cfg_path.write_text(
+                yaml.safe_dump({
+                    "providers": {
+                        "elevenlabs": {"api_key": "el-k"},
+                        "gemini": {"api_key": "gm-k"},
+                    },
+                    "transcript": {
+                        "vad_mode": "none",
+                        "provider": "elevenlabs",
+                        "model": "scribe_v3",
+                        "ref_enabled": True,
+                        "ref_model": "gemini-3.5-transcribe",
+                    },
+                }),
+                encoding="utf-8",
+            )
+            media = d / "clip.wav"
+            media.write_bytes(b"RIFF")
+
+            def fake_subproc(cmd, **_kw):
+                out_f = Path(cmd[-1])
+                # 1s of 16kHz float32 zeros
+                out_f.write_bytes(b"\x00" * (16000 * 4))
+
+            el_resp = {"language_code": "rus", "words": [{"text": "на", "start": 0.1, "end": 0.3, "type": "word"}, {"text": " ", "start": 0.3, "end": 0.35, "type": "spacing"}, {"text": "сцене", "start": 0.35, "end": 0.8, "type": "word"}]}
+            gm_resp = {"steps": [{"content": [{"annotations": [{"type": "word_info", "text": "на", "start_offset": "0.1s", "end_offset": "0.3s"}, {"type": "word_info", "text": "Свене", "start_offset": "0.35s", "end_offset": "0.8s"}]}]}]}
+
+            with (
+                mock.patch("src.transcribe.subprocess.run", side_effect=fake_subproc),
+                mock.patch("src.transcribe.render_chunk_mp3", side_effect=lambda pcm, cm, out_p, **kw: out_p.write_bytes(b"MP3")),
+                mock.patch("src.providers.elevenlabs.post_multipart", return_value=el_resp),
+                mock.patch("src.providers.gemini.upload_resumable_file", return_value={"name": "files/1", "uri": "https://x/1"}),
+                mock.patch("src.providers.gemini.call_gemini_interactions_transcribe", return_value=gm_resp),
+                mock.patch("src.providers.gemini.delete_url"),
+            ):
+                p_srt, r_srt = transcribe_media_pair(media, defaults_path=cfg_path, output_path=d / "out.srt")
+            self.assertIsNotNone(p_srt)
+            self.assertIsNotNone(r_srt)
+            assert p_srt is not None and r_srt is not None
+            self.assertTrue(p_srt.is_file() and r_srt.is_file())
+            self.assertEqual(r_srt.name, "out_ref.srt")
+            self.assertIn("на сцене", p_srt.read_text(encoding="utf-8"))
+            self.assertIn("на Свене", r_srt.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

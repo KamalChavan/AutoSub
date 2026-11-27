@@ -134,13 +134,21 @@ autosub translate "P02_死灵龙.srt" \
   --reasoning-effort medium \
   --auto-context
 
-# 高阶：双 ASR 交叉仲裁（以 ElevenLabs 为主轨时间轴 + Gemini 原语字幕为参考轨纠偏）
+# 高阶：双 ASR 交叉仲裁（对已有两份 SRT 翻译）
 autosub translate "elevenlabs.srt" \
   --ref-srt "gemini_35_transcribe.srt" \
   --profile twitch_dota2 \
   --model openai/gpt-6.2-sol \
   --reasoning-effort medium \
   --auto-context
+
+# 或在 config/defaults.yaml 中直接常开双 ASR（一次 VAD 切片，并行转录主+参考轨并自动仲裁）：
+#   transcript:
+#     provider: "elevenlabs"
+#     model: "scribe_v3"
+#     ref_enabled: true
+#     ref_model: "gemini-3.5-transcribe"
+# 配置好后一条 `autosub run vod.mp4 -p twitch_dota2 --auto-context` 即可全自动跑完（可用 `--no-ref-transcript` 临时关闭）。
 ```
 
 > 提示：

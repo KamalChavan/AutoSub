@@ -77,6 +77,11 @@ transcript:
   no_verbatim: false             # 开启后过滤口癖/填充词/结巴
   numbers_format: ""             # 仅 scribe_v3 生效: "digits" | "words" | ""
   keyterms: []                   # 注意：ElevenLabs keyterms 会增加 +25% 计费，按需显式开启
+  # 双 ASR 参考轨开关（设为 true 后，`run` / `transcript` 仅执行一次 VAD 切片，并行调用主+参考模型，
+  # 并将参考原语字幕自动传给翻译模型做交叉仲裁；例如主轨 elevenlabs/scribe_v3 + 参考轨 gemini-3.5-transcribe）
+  ref_enabled: false
+  ref_provider: ""               # 留空自动从 ref_model 推断，如 "gemini"
+  ref_model: ""                  # 如 "gemini-3.5-transcribe"
 
 translate:
   # 默认使用的 Profile（profiles/<name>.yaml 或任意外部 YAML 路径）

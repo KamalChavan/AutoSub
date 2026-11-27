@@ -19,7 +19,7 @@ from src.config import (
 )
 from src.profile import list_profiles
 from src.providers import provider_capabilities
-from src.transcribe import run_transcript_cli, transcribe_media
+from src.transcribe import run_transcript_cli, transcribe_media_pair
 from src.translate import normalize_translate_model_specs, run_translate_cli, translate_srt
 from src.vad import probe_silero_vad_runtime
 
@@ -84,6 +84,27 @@ def _add_transcript_common_args(p: argparse.ArgumentParser) -> None:
         choices=["digits", "words"],
         default=None,
         help="可选：数字输出格式（仅 ElevenLabs scribe_v3 生效：digits 或 words）",
+    )
+    p.add_argument(
+        "--ref-model",
+        "--ref-transcript-model",
+        dest="ref_model",
+        default=None,
+        help="可选：临时启用双 ASR 并指定参考转录模型（如 gemini-3.5-transcribe；也可在 config/defaults.yaml 中配置 ref_enabled: true）",
+    )
+    p.add_argument(
+        "--ref-provider",
+        "--ref-transcript-provider",
+        dest="ref_provider",
+        default=None,
+        help="可选：覆盖双 ASR 参考转录厂商（如 gemini / elevenlabs）",
+    )
+    p.add_argument(
+        "--no-ref-transcript",
+        dest="ref_enabled",
+        action="store_false",
+        default=None,
+        help="可选：临时关闭 YAML 中启用的双 ASR 参考轨",
     )
 
 
@@ -193,6 +214,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_transcript_common_args(tr_parser)
     tr_parser.add_argument("-o", "--output", default=None, help="输出原语 .srt 路径（默认同目录同名 .srt）")
+    tr_parser.add_argument("--ref-output", default=None, help="可选：双 ASR 参考轨原语 .srt 保存路径（默认 <output>_ref.srt）")
 
     # 2. translate
     tl_parser = subparsers.add_parser(
@@ -262,6 +284,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_translate_args(run_parser)
     run_parser.add_argument("--srt-output", default=None, help="可选：中间原语 .srt 保存路径")
+    run_parser.add_argument("--ref-srt-output", default=None, help="可选：双 ASR 参考轨中间 .srt 保存路径")
     run_parser.add_argument("-o", "--output", default=None, help="可选：最终翻译 .srt 保存路径")
 
     # 4. providers
@@ -311,6 +334,10 @@ def run_providers(defaults_path: Path) -> int:
 
     tr_provider = str(tr_cfg.get("provider") or "gemini")
     tr_model = str(tr_cfg.get("model") or "gemini-3.5-transcribe")
+    ref_enabled = bool(tr_cfg.get("ref_enabled", False))
+    ref_model = str(tr_cfg.get("ref_model") or "").strip()
+    ref_provider = str(tr_cfg.get("ref_provider") or "").strip()
+    ref_label = f"{ref_provider}/{ref_model}" if ref_provider and ref_model else (ref_model or ref_provider or "(未指定)")
     tl_specs = normalize_translate_model_specs(
         tl_cfg.get("models"),
         default_provider=str(tl_cfg.get("provider") or "gemini"),
@@ -318,6 +345,7 @@ def run_providers(defaults_path: Path) -> int:
     )
     tl_desc = " -> ".join(s.display_label for s in tl_specs)
     print(f"默认转录路由: {tr_provider}/{tr_model}", flush=True)
+    print(f"双 ASR 参考轨: {'已启用 (' + ref_label + ')' if ref_enabled else '未启用 (可在 config/defaults.yaml 中开启 transcript.ref_enabled)'}", flush=True)
     print(f"默认翻译链: {tl_desc}", flush=True)
     return 0
 
@@ -396,9 +424,13 @@ def main(argv: list[str] | None = None) -> int:
             defaults_path=defaults_path,
             profile_name=args.profile,
             output_path=Path(args.output).resolve() if args.output else None,
+            ref_output_path=Path(args.ref_output).resolve() if args.ref_output else None,
             vad_override=args.vad,
             provider_override=args.provider,
             model_override=args.model,
+            ref_enabled_override=args.ref_enabled,
+            ref_provider_override=args.ref_provider,
+            ref_model_override=args.ref_model,
             max_chunk_seconds_override=args.max_chunk_seconds,
             language_override=args.lang,
             secondary_languages_override=args.secondary_lang or None,
@@ -430,14 +462,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         try:
-            raw_srt = transcribe_media(
+            raw_srt, ref_srt = transcribe_media_pair(
                 Path(args.input).resolve(),
                 defaults_path=defaults_path,
                 profile_name=args.profile,
                 output_path=Path(args.srt_output).resolve() if args.srt_output else None,
+                ref_output_path=Path(args.ref_srt_output).resolve() if args.ref_srt_output else None,
                 vad_override=args.vad,
                 provider_override=args.transcript_provider,
                 model_override=args.transcript_model,
+                ref_enabled_override=args.ref_enabled,
+                ref_provider_override=args.ref_provider,
+                ref_model_override=args.ref_model,
                 max_chunk_seconds_override=args.max_chunk_seconds,
                 language_override=args.lang,
                 secondary_languages_override=args.secondary_lang or None,
@@ -463,6 +499,7 @@ def main(argv: list[str] | None = None) -> int:
                 auto_context_override=args.auto_context,
                 merge_cues_override=args.merge_cues,
                 polish_timing_override=args.polish_timing,
+                ref_srt_path=ref_srt,
                 output_path=Path(args.output).resolve() if args.output else None,
             )
             return 0

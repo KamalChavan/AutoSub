@@ -312,7 +312,13 @@ def polish_srt_timing(
 
 
 def _norm_compare_text(text: str) -> str:
-    return re.sub(r"[^\w]+", "", (text or "").lower())
+    """Normalize punctuation, case, and trivial Russian spelling variants for dual-ASR diffing."""
+    t = (text or "").lower().replace("ё", "е").replace("ъ", "ь")
+    t = re.sub(r"\bблять\b", "блядь", t)
+    t = re.sub(r"\bче\b", "что", t)
+    cleaned = re.sub(r"[^\w]+", "", t)
+    # Collapse doubled letters (e.g. спелл/спел, килл/кил, баттерфляй/батерфляй) for comparison only
+    return re.sub(r"(.)\1+", r"\1", cleaned)
 
 
 def align_reference_srt(
@@ -320,13 +326,17 @@ def align_reference_srt(
     ref_cues: list[SrtCue],
     *,
     pad: float = 0.5,
+    max_similarity: float = 0.95,
 ) -> dict[int, str]:
     """Align a secondary ASR SRT track onto primary cue IDs for dual-ASR disambiguation.
 
-    Returns `{primary_cue.id: ref_text}` only when overlapping reference text differs from primary text.
+    Returns `{primary_cue.id: ref_text}` only when overlapping reference text has a meaningful
+    lexical difference from primary text (filtering out pure spelling/ё/filler noise).
     """
     if not primary_cues or not ref_cues:
         return {}
+
+    from difflib import SequenceMatcher
 
     aligned: dict[int, str] = {}
     ref_idx = 0
@@ -358,7 +368,14 @@ def align_reference_srt(
         parts = strict_parts if strict_parts else prox_parts
         if parts:
             ref_text = " ".join(parts).strip()
-            if ref_text and _norm_compare_text(ref_text) != _norm_compare_text(pc.text):
-                aligned[pc.id] = ref_text
+            if not ref_text:
+                continue
+            np_txt = _norm_compare_text(pc.text)
+            nr_txt = _norm_compare_text(ref_text)
+            if not nr_txt or np_txt == nr_txt:
+                continue
+            if max_similarity < 1.0 and SequenceMatcher(None, np_txt, nr_txt).ratio() >= max_similarity:
+                continue
+            aligned[pc.id] = ref_text
 
     return aligned
