@@ -65,9 +65,9 @@ transcript:
   silence_min_duration_s: 1.5
   # 单次转写分段上限（秒；Gemini 词级时间戳硬上限 1800s，留余量 1680s = 28 分钟；Whisper 类自动受 24MB 上限约束）
   max_chunk_seconds: 1680
-  # 默认转录厂商与模型（可改为 provider: "elevenlabs", model: "scribe_v3"，或通过 --model elevenlabs/scribe_v3 临时覆盖）
-  provider: "gemini"
-  model: "gemini-3.5-transcribe"
+  # 默认转录厂商与模型（默认 ElevenLabs Scribe v3；可改为 provider: "gemini", model: "gemini-3.5-transcribe" 或通过 --model 临时覆盖）
+  provider: "elevenlabs"
+  model: "scribe_v3"
   max_retries: 6
   # ElevenLabs Scribe / Whisper 可选参数（Gemini 模式下自动忽略）
   language_code: ""              # 留空自动识别，如 "rus" / "eng" / "zho"

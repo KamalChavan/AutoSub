@@ -110,6 +110,8 @@ def _mk_resp(payload_obj: dict, *, tier: str = "STANDARD", in_tok: int = 120, ou
 class TestConfigAndProfiles(unittest.TestCase):
     def test_engine_defaults_and_chain_has_no_flex(self) -> None:
         cfg = load_engine_config()
+        self.assertEqual(cfg["transcript"]["provider"], "elevenlabs")
+        self.assertEqual(cfg["transcript"]["model"], "scribe_v3")
         chain = normalize_translate_chain(cfg["translate"]["models"])
         self.assertEqual(
             chain,

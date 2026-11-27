@@ -29,6 +29,7 @@ from src.providers import (
     create_transcribe_provider,
     parse_model_spec,
 )
+from src.providers.elevenlabs import DEFAULT_ELEVENLABS_TRANSCRIBE_MODEL
 from src.providers.gemini import (
     DEFAULT_GEMINI_TRANSCRIBE_MODEL,
     call_gemini_interactions_transcribe,
@@ -44,7 +45,8 @@ from src.vad import (
     render_chunk_mp3,
 )
 
-DEFAULT_TRANSCRIBE_MODEL = DEFAULT_GEMINI_TRANSCRIBE_MODEL
+DEFAULT_TRANSCRIBE_PROVIDER = "elevenlabs"
+DEFAULT_TRANSCRIBE_MODEL = DEFAULT_ELEVENLABS_TRANSCRIBE_MODEL
 _MP3_48K_BYTES_PER_SEC_ESTIMATE = 6400.0  # 48 kbps = 6000 B/s + container overhead
 
 
@@ -86,7 +88,7 @@ def call_gemini_transcribe(
     file_uri: str,
     *,
     api_key: str,
-    model: str = DEFAULT_TRANSCRIBE_MODEL,
+    model: str = DEFAULT_GEMINI_TRANSCRIBE_MODEL,
     api_base: str = "https://generativelanguage.googleapis.com/v1beta",
     proxy: str = "",
     max_retries: int = 6,
@@ -140,9 +142,9 @@ def extract_words_from_interaction(
 
 def _default_model_for_provider(provider_name: str, protocol: str) -> str:
     if protocol == "elevenlabs":
-        return "scribe_v3"
+        return DEFAULT_ELEVENLABS_TRANSCRIBE_MODEL
     if protocol == "gemini":
-        return DEFAULT_TRANSCRIBE_MODEL
+        return DEFAULT_GEMINI_TRANSCRIBE_MODEL
     if protocol == "openai":
         return "whisper-1"
     return DEFAULT_TRANSCRIBE_MODEL
@@ -236,7 +238,7 @@ def transcribe_media_pair(
         profile = load_profile(profile_name)
         tr_cfg.update(profile.transcript)
 
-    cfg_provider = str(tr_cfg.get("provider") or "gemini").strip().lower()
+    cfg_provider = str(tr_cfg.get("provider") or DEFAULT_TRANSCRIBE_PROVIDER).strip().lower()
     raw_model = str(model_override or tr_cfg.get("model") or "").strip()
     if provider_override and not model_override:
         ov_key = provider_override.strip().lower()
@@ -244,7 +246,9 @@ def transcribe_media_pair(
         if ov_key != cfg_provider:
             raw_model = _default_model_for_provider(ov_key, ov_proto)
     if not raw_model:
-        raw_model = DEFAULT_TRANSCRIBE_MODEL
+        eff_key = (provider_override or cfg_provider).strip().lower()
+        eff_proto = str((providers_cfg.get(eff_key) or {}).get("protocol") or eff_key).strip().lower()
+        raw_model = _default_model_for_provider(eff_key, eff_proto)
 
     spec = parse_model_spec(
         raw_model,

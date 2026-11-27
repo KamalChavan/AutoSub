@@ -210,7 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
     tr_parser.add_argument(
         "--model",
         default=None,
-        help="覆盖语音转写模型（支持 provider/model 前缀，如 gemini-3.5-transcribe / elevenlabs/scribe_v3）",
+        help="覆盖语音转写模型（默认 elevenlabs/scribe_v3；支持 provider/model 前缀，如 gemini/gemini-3.5-transcribe）",
     )
     _add_transcript_common_args(tr_parser)
     tr_parser.add_argument("-o", "--output", default=None, help="输出原语 .srt 路径（默认同目录同名 .srt）")
@@ -262,14 +262,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--transcript-provider",
         default=None,
-        help="覆盖语音转录厂商（如 elevenlabs / gemini / openai）",
+        help="覆盖语音转录厂商（默认 elevenlabs；可选 gemini / openai）",
     )
     run_parser.add_argument(
         "--transcript-model",
         "--model",
         dest="transcript_model",
         default=None,
-        help="覆盖语音转写模型（如 elevenlabs/scribe_v3 / gemini-3.5-transcribe；--model 为兼容别名）",
+        help="覆盖语音转写模型（默认 elevenlabs/scribe_v3；如 gemini/gemini-3.5-transcribe；--model 为兼容别名）",
     )
     _add_transcript_common_args(run_parser)
     run_parser.add_argument(
@@ -332,8 +332,8 @@ def run_providers(defaults_path: Path) -> int:
         print(f"  - {name} [protocol={proto}, 能力={caps}{mode_part}]", flush=True)
         print(f"      api_base: {api_base} | API Key: {key_status}", flush=True)
 
-    tr_provider = str(tr_cfg.get("provider") or "gemini")
-    tr_model = str(tr_cfg.get("model") or "gemini-3.5-transcribe")
+    tr_provider = str(tr_cfg.get("provider") or "elevenlabs")
+    tr_model = str(tr_cfg.get("model") or "scribe_v3")
     ref_enabled = bool(tr_cfg.get("ref_enabled", False))
     ref_model = str(tr_cfg.get("ref_model") or "").strip()
     ref_provider = str(tr_cfg.get("ref_provider") or "").strip()
@@ -362,6 +362,7 @@ def run_doctor(defaults_path: Path, *, strict_bundle: bool = False) -> int:
 
     profiles = list_profiles()
     profiles_ok = len(profiles) > 0
+    elevenlabs_ok = bool(resolve_provider_api_key(providers_cfg["elevenlabs"]))
     gemini_ok = bool(resolve_provider_api_key(providers_cfg["gemini"]))
 
     print("=== [AutoSub 环境自检] ===", flush=True)
@@ -376,10 +377,11 @@ def run_doctor(defaults_path: Path, *, strict_bundle: bool = False) -> int:
         flush=True,
     )
     print(f"内置 Profile: {', '.join(n for n, _, _ in profiles) or '未找到'}", flush=True)
-    print(f"Gemini API Key: {'已配置' if gemini_ok else '未配置（请设置 GEMINI_API_KEY 或创建 .env）'}", flush=True)
-    print("多厂商 API Key 状态:", flush=True)
+    print(f"ElevenLabs API Key (默认转录): {'已配置' if elevenlabs_ok else '未配置（请设置 ELEVENLABS_API_KEY 或创建 .env）'}", flush=True)
+    print(f"Gemini API Key (默认翻译): {'已配置' if gemini_ok else '未配置（请设置 GEMINI_API_KEY 或创建 .env）'}", flush=True)
+    print("其他厂商 API Key 状态:", flush=True)
     for name, cfg in providers_cfg.items():
-        if name == "gemini":
+        if name in ("gemini", "elevenlabs"):
             continue
         proto = str(cfg.get("protocol") or name)
         caps = provider_capabilities(proto)
