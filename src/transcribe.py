@@ -37,7 +37,13 @@ from src.providers.gemini import (
     call_gemini_interactions_transcribe,
     extract_gemini_words,
 )
-from src.srt import append_srt_cues, group_words_to_cues, map_word_to_original
+from src.srt import (
+    append_srt_cues,
+    default_words_json_path,
+    group_words_to_cues,
+    map_word_to_original,
+    save_words_json,
+)
 from src.vad import (
     SR,
     detect_speech_segments_silencedetect,
@@ -268,6 +274,8 @@ def transcribe_media_pair(
     profile_name: str | None = None,
     output_path: Path | None = None,
     ref_output_path: Path | None = None,
+    words_output_path: Path | None = None,
+    save_words_json_override: bool | None = None,
     vad_override: str | None = None,
     provider_override: str | None = None,
     model_override: str | None = None,
@@ -284,7 +292,7 @@ def transcribe_media_pair(
     use_cache_override: bool | None = None,
     cache: ResultCache | None = None,
 ) -> tuple[Path | None, Path | None]:
-    """Transcribe media to primary SRT (and optional reference ASR SRT when dual-ASR is enabled).
+    """Transcribe media to primary SRT (plus optional `.words.json` sidecar and reference ASR SRT).
 
     Runs FFmpeg decode, Silero VAD, and MP3 chunk encoding ONCE, then dispatches primary + reference
     providers concurrently per chunk (with optional SQLite content-hash chunk caching).
@@ -302,6 +310,16 @@ def transcribe_media_pair(
     if profile_name:
         profile = load_profile(profile_name)
         tr_cfg.update(profile.transcript)
+
+    save_words = (
+        True
+        if words_output_path is not None
+        else (
+            bool(save_words_json_override)
+            if save_words_json_override is not None
+            else bool(tr_cfg.get("save_words_json", True))
+        )
+    )
 
     cfg_provider = str(tr_cfg.get("provider") or DEFAULT_TRANSCRIBE_PROVIDER).strip().lower()
     raw_model = str(model_override or tr_cfg.get("model") or "").strip()
@@ -445,6 +463,10 @@ def transcribe_media_pair(
             ref_out_srt.parent.mkdir(parents=True, exist_ok=True)
             ref_out_srt.write_text("", encoding="utf-8")
 
+        words_out_path: Path | None = (
+            (words_output_path or default_words_json_path(out_srt)) if save_words else None
+        )
+        all_primary_words: list[dict[str, Any]] = []
         total_words = 0
         written_cues = 0
         ref_total_words = 0
@@ -576,6 +598,15 @@ def transcribe_media_pair(
 
             words = map_transcribed_words_to_original(res.words, ch_map)
             total_words += len(words)
+            if words_out_path is not None and words:
+                all_primary_words.extend(words)
+                save_words_json(
+                    all_primary_words,
+                    words_out_path,
+                    provider=spec.provider,
+                    model=spec.model,
+                    source_media=input_path.name,
+                )
             chunk_cues = group_words_to_cues(words)
             if chunk_cues:
                 written_cues = append_srt_cues(
@@ -624,6 +655,8 @@ def transcribe_media_pair(
                     )
 
         print(f"[4/4] 原语字幕已生成: {out_srt}（共 {total_words} 词 / {written_cues} 条 SRT）", flush=True)
+        if words_out_path is not None and all_primary_words:
+            print(f"[4/4] 词级时间戳已保存: {words_out_path}（共 {len(all_primary_words)} 词）", flush=True)
         final_ref_srt: Path | None = None
         if ref_out_srt is not None:
             if ref_written_cues > 0:
@@ -646,6 +679,8 @@ def transcribe_media(
     defaults_path: Path = DEFAULT_CONFIG_PATH,
     profile_name: str | None = None,
     output_path: Path | None = None,
+    words_output_path: Path | None = None,
+    save_words_json_override: bool | None = None,
     vad_override: str | None = None,
     provider_override: str | None = None,
     model_override: str | None = None,
@@ -665,6 +700,8 @@ def transcribe_media(
         defaults_path=defaults_path,
         profile_name=profile_name,
         output_path=output_path,
+        words_output_path=words_output_path,
+        save_words_json_override=save_words_json_override,
         vad_override=vad_override,
         provider_override=provider_override,
         model_override=model_override,
@@ -688,6 +725,8 @@ def run_transcript_cli(
     profile_name: str | None = None,
     output_path: Path | None = None,
     ref_output_path: Path | None = None,
+    words_output_path: Path | None = None,
+    save_words_json_override: bool | None = None,
     vad_override: str | None = None,
     provider_override: str | None = None,
     model_override: str | None = None,
@@ -710,6 +749,8 @@ def run_transcript_cli(
             profile_name=profile_name,
             output_path=output_path,
             ref_output_path=ref_output_path,
+            words_output_path=words_output_path,
+            save_words_json_override=save_words_json_override,
             vad_override=vad_override,
             provider_override=provider_override,
             model_override=model_override,

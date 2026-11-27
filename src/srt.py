@@ -1,6 +1,7 @@
 """SRT parsing, incremental writing, timestamp remapping, and word-to-cue grouping."""
 from __future__ import annotations
 
+import json
 import math
 import re
 import unicodedata
@@ -554,3 +555,139 @@ def align_reference_srt(
             aligned[pc.id] = ref_text
 
     return aligned
+
+
+WORDS_JSON_SCHEMA_VERSION = 1
+
+
+def default_words_json_path(srt_path: Path) -> Path:
+    """Return default sidecar `.words.json` path beside an `.srt` path (e.g. `foo.srt` -> `foo.words.json`)."""
+    if srt_path.name.lower().endswith(".words.json"):
+        return srt_path
+    return srt_path.with_name(f"{srt_path.stem}.words.json")
+
+
+def find_sidecar_words_json(srt_path: Path) -> Path | None:
+    """Locate an existing sidecar `.words.json` beside an `.srt` file, or return None."""
+    if srt_path.name.lower().endswith(".words.json"):
+        return srt_path if srt_path.is_file() else None
+    cand = default_words_json_path(srt_path)
+    return cand if cand.is_file() else None
+
+
+def save_words_json(
+    words: list[dict[str, Any]],
+    path: Path,
+    *,
+    provider: str = "",
+    model: str = "",
+    source_media: str = "",
+) -> Path:
+    """Persist original-timeline word-level timestamps to a compact `.words.json` sidecar file."""
+    cleaned = clamp_stretched_words(words)
+    serialized_words: list[dict[str, Any]] = []
+    for wid, w in enumerate(cleaned, 1):
+        txt = str(w.get("text") or "").strip()
+        if not txt:
+            continue
+        item: dict[str, Any] = {
+            "id": len(serialized_words) + 1,
+            "seg": int(w.get("seg", 0)),
+            "start": round(max(0.0, float(w.get("start", 0.0))), 3),
+            "end": round(max(0.0, float(w.get("end", 0.0))), 3),
+            "text": txt,
+            "space_before": bool(w.get("space_before", True)),
+        }
+        if item["end"] <= item["start"]:
+            item["end"] = round(item["start"] + 0.05, 3)
+        spk = w.get("speaker") or w.get("speaker_id")
+        if spk:
+            item["speaker"] = str(spk)
+        serialized_words.append(item)
+
+    payload = {
+        "schema_version": WORDS_JSON_SCHEMA_VERSION,
+        "provider": str(provider or ""),
+        "model": str(model or ""),
+        "source_media": str(source_media or ""),
+        "word_count": len(serialized_words),
+        "words": serialized_words,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def load_words_json(path: Path) -> list[dict[str, Any]]:
+    """Load and normalize word-level timestamps from a `.words.json` file with sequential 1-based `id`s."""
+    if not path.is_file():
+        raise FileNotFoundError(f"找不到词级时间戳文件: {path}")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(raw, dict):
+        raw_words = raw.get("words")
+    elif isinstance(raw, list):
+        raw_words = raw
+    else:
+        raw_words = None
+    if not isinstance(raw_words, list):
+        raise ValueError(f"无效的 .words.json 格式（缺少 words 列表）: {path}")
+
+    parsed: list[dict[str, Any]] = []
+    for item in raw_words:
+        if not isinstance(item, dict):
+            continue
+        txt = str(item.get("text") or "").strip()
+        if not txt:
+            continue
+        ws = max(0.0, float(item.get("start", 0.0)))
+        we = max(ws + 0.05, float(item.get("end", ws + 0.05)))
+        entry: dict[str, Any] = {
+            "seg": int(item.get("seg", 0)),
+            "start": ws,
+            "end": we,
+            "text": txt,
+            "space_before": bool(item.get("space_before", True)),
+        }
+        spk = item.get("speaker") or item.get("speaker_id")
+        if spk:
+            entry["speaker"] = str(spk)
+        parsed.append(entry)
+
+    cleaned = clamp_stretched_words(parsed)
+    for wid, entry in enumerate(cleaned, 1):
+        entry["id"] = wid
+    return cleaned
+
+
+def reconstruct_cues_from_word_spans(
+    words: list[dict[str, Any]],
+    spans: list[tuple[int, int]],
+) -> list[SrtCue]:
+    """Deterministically build monotonic non-overlapping `SrtCue`s from 1-based inclusive word ID spans."""
+    if not words or not spans:
+        return []
+    by_id: dict[int, int] = {}
+    for idx, w in enumerate(words):
+        wid = int(w.get("id", idx + 1))
+        by_id[wid] = idx
+
+    cues: list[SrtCue] = []
+    for start_wid, end_wid in spans:
+        s_idx = by_id.get(int(start_wid))
+        e_idx = by_id.get(int(end_wid))
+        if s_idx is None or e_idx is None or e_idx < s_idx:
+            continue
+        buf = words[s_idx : e_idx + 1]
+        if not buf:
+            continue
+        start = max(0.0, float(buf[0]["start"]))
+        end = float(buf[-1]["end"])
+        if cues and start < cues[-1].end:
+            start = cues[-1].end
+        if end <= start:
+            end = start + 0.15
+        text = _join_word_buf(buf).strip()
+        if not text:
+            continue
+        cues.append(SrtCue(id=len(cues) + 1, start=round(start, 3), end=round(end, 3), text=text))
+    return cues

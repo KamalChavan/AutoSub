@@ -40,10 +40,13 @@ from src.providers import (
     create_translate_provider,
     parse_model_spec,
 )
+from src.resegment import resegment_words_with_llm
 from src.srt import (
     SrtCue,
     align_reference_srt,
     append_srt_cues,
+    find_sidecar_words_json,
+    load_words_json,
     parse_srt,
     polish_srt_timing,
     wrap_subtitle_line,
@@ -1319,17 +1322,21 @@ def translate_srt(
     polish_timing_override: bool | None = None,
     repair_missing_override: bool | None = None,
     max_line_chars_override: float | None = None,
+    resegment_override: bool | None = None,
+    words_json_path: Path | None = None,
+    resegment_max_chars_override: float | None = None,
     use_cache_override: bool | None = None,
     log_llm_override: bool | None = None,
     ref_srt_path: Path | None = None,
     output_path: Path | None = None,
 ) -> Path:
-    """Translate an original-language `.srt` file using a profile and optional `--var` overrides."""
+    """Translate an original-language `.srt` (or `.words.json`) file using a profile and optional `--var` overrides."""
     if not input_path.is_file():
         raise FileNotFoundError(f"找不到输入字幕文件: {input_path}")
-    if input_path.suffix.lower() != ".srt":
+    is_words_input = input_path.name.lower().endswith(".words.json")
+    if not is_words_input and input_path.suffix.lower() != ".srt":
         raise ValueError(
-            f"`translate` 仅接受 .srt 文件；视频/音频请先运行 `python3 main.py transcript {input_path.name}` 或 `run`"
+            f"`translate` 仅接受 .srt 或 .words.json 文件；视频/音频请先运行 `python3 main.py transcript {input_path.name}` 或 `run`"
         )
 
     defaults = load_engine_config(defaults_path)
@@ -1357,16 +1364,12 @@ def translate_srt(
     glossary_text = render_glossary_section(merge_glossaries(glossary_paths)) if glossary_paths else ""
 
     bilingual = profile.bilingual if bilingual_override is None else bilingual_override
-    cues = parse_srt(input_path)
-    if not cues:
-        raise ValueError(f"字幕文件为空或格式无效: {input_path}")
 
-    ref_asr_map: dict[int, str] = {}
+    ref_cues: list[SrtCue] = []
     if ref_srt_path is not None:
         if not ref_srt_path.is_file():
             raise FileNotFoundError(f"找不到参考 ASR 字幕文件: {ref_srt_path}")
         ref_cues = parse_srt(ref_srt_path)
-        ref_asr_map = align_reference_srt(cues, ref_cues)
 
     allow_merge = (
         bool(merge_cues_override)
@@ -1394,6 +1397,38 @@ def translate_srt(
         else profile.translate.get("max_line_chars", tl_cfg.get("max_line_chars", 24))
     )
     max_line_chars = max(0.0, float(raw_max_line if raw_max_line is not None else 24))
+
+    resegment_enabled = (
+        bool(resegment_override)
+        if resegment_override is not None
+        else (
+            True
+            if (words_json_path is not None or is_words_input)
+            else bool(profile.translate.get("resegment", tl_cfg.get("resegment", True)))
+        )
+    )
+    if words_json_path is not None and not words_json_path.is_file():
+        raise FileNotFoundError(f"找不到词级时间戳文件: {words_json_path}")
+    effective_words_path: Path | None = None
+    if resegment_enabled:
+        if words_json_path is not None:
+            effective_words_path = words_json_path
+        elif is_words_input:
+            effective_words_path = input_path
+        else:
+            effective_words_path = find_sidecar_words_json(input_path)
+
+    reseg_max_chars = float(
+        resegment_max_chars_override
+        if resegment_max_chars_override is not None
+        else profile.translate.get("resegment_max_cue_chars", tl_cfg.get("resegment_max_cue_chars", 28))
+    )
+    reseg_max_dur = float(
+        profile.translate.get("resegment_max_cue_duration_s", tl_cfg.get("resegment_max_cue_duration_s", 5.5))
+    )
+    reseg_hard_gap = float(
+        profile.translate.get("resegment_hard_gap_s", tl_cfg.get("resegment_hard_gap_s", 1.2))
+    )
     max_merge_gap = float(tl_cfg.get("max_merge_gap_s", 1.8))
     max_merge_duration = float(tl_cfg.get("max_merge_duration_s", 6.5))
 
@@ -1405,35 +1440,15 @@ def translate_srt(
         or profile.translate.get("max_cues_per_batch")
         or tl_cfg.get("max_cues_per_batch", 280)
     )
-    batches = split_cues_by_gaps(cues, max_per_batch=max_per_batch)
+    base_stem = (
+        input_path.name[: -len(".words.json")]
+        if is_words_input
+        else input_path.stem
+    )
     default_suffix = "_bilingual.srt" if bilingual else "_translated.srt"
-    out = output_path or input_path.with_name(f"{input_path.stem}{default_suffix}")
+    out = output_path or input_path.with_name(f"{base_stem}{default_suffix}")
     retry_503 = int(tl_cfg.get("retry_503", 3))
     chain_desc = " -> ".join(s.display_label for s in active_specs)
-
-    merged_vars = {**profile.default_vars, **vars_override}
-    var_summary = ", ".join(f"{k}={v}" for k, v in merged_vars.items()) or "(无)"
-    wrap_desc = f"开(≤{max_line_chars:g}字)" if max_line_chars > 0 else "关"
-    feat_flags = [
-        f"Pass0上下文={'开' if auto_context else '关'}",
-        f"碎句合并={'开' if allow_merge else '关'}",
-        f"漏译补译={'开' if repair_missing else '关'}",
-        f"排轴优化={'开' if polish_timing else '关'}",
-        f"平衡折行={wrap_desc}",
-        f"本地缓存={'开' if cache is not None else '关'}",
-    ]
-    if ref_srt_path is not None:
-        feat_flags.append(f"双ASR参考={ref_srt_path.name}({len(ref_asr_map)}处差异)")
-
-    print("=== [AutoSub 字幕翻译] ===", flush=True)
-    print(f"配置档位: {profile.name} ({profile.source_path.name})", flush=True)
-    print(f"输入字幕: {input_path}（共 {len(cues)} 条，按静音间隙分为 {len(batches)} 批：{[len(b) for b in batches]}）", flush=True)
-    print(f"输出路径: {out}（{'双语' if bilingual else '单语'}，每批完成即实时落盘）", flush=True)
-    print(f"任务变量: {var_summary} | 术语表: {len(glossary_paths)} 份", flush=True)
-    print(f"增强特性: {' | '.join(feat_flags)}", flush=True)
-    if llm_logger is not None:
-        print(f"调试日志: {llm_logger.log_path}", flush=True)
-    print(f"模型链: {chain_desc}（503 原地重试 {retry_503} 次后切换）", flush=True)
 
     system_prompt = render_prompt(profile, vars_override=vars_override, glossary_text=glossary_text)
     models_dicts = [
@@ -1455,6 +1470,63 @@ def translate_srt(
         cache=cache,
         llm_logger=llm_logger,
     )
+
+    merged_vars = {**profile.default_vars, **vars_override}
+    var_summary = ", ".join(f"{k}={v}" for k, v in merged_vars.items()) or "(无)"
+    wrap_desc = f"开(≤{max_line_chars:g}字)" if max_line_chars > 0 else "关"
+    reseg_desc = (
+        f"开({effective_words_path.name})"
+        if effective_words_path is not None
+        else ("关" if not resegment_enabled else "跳过(无.words.json)")
+    )
+    feat_flags = [
+        f"词级重断句={reseg_desc}",
+        f"Pass0上下文={'开' if auto_context else '关'}",
+        f"碎句合并={'开' if allow_merge else '关'}",
+        f"漏译补译={'开' if repair_missing else '关'}",
+        f"排轴优化={'开' if polish_timing else '关'}",
+        f"平衡折行={wrap_desc}",
+        f"本地缓存={'开' if cache is not None else '关'}",
+    ]
+
+    print("=== [AutoSub 字幕翻译] ===", flush=True)
+    print(f"配置档位: {profile.name} ({profile.source_path.name})", flush=True)
+    print(f"输出路径: {out}（{'双语' if bilingual else '单语'}，每批完成即实时落盘）", flush=True)
+    print(f"任务变量: {var_summary} | 术语表: {len(glossary_paths)} 份", flush=True)
+    print(f"增强特性: {' | '.join(feat_flags)}", flush=True)
+    if llm_logger is not None:
+        print(f"调试日志: {llm_logger.log_path}", flush=True)
+    print(f"模型链: {chain_desc}（503 原地重试 {retry_503} 次后切换）", flush=True)
+
+    cues: list[SrtCue] = []
+    if effective_words_path is not None:
+        words_data = load_words_json(effective_words_path)
+        if words_data:
+            cues, _reseg_info = resegment_words_with_llm(
+                words_data,
+                translator=translator,
+                hard_gap_s=reseg_hard_gap,
+                max_cue_chars=reseg_max_chars,
+                max_cue_duration_s=reseg_max_dur,
+                progress_fn=lambda msg: print(msg, flush=True),
+            )
+    if not cues:
+        if is_words_input:
+            from src.srt import group_words_to_cues
+            cues = group_words_to_cues(load_words_json(input_path))
+        else:
+            cues = parse_srt(input_path)
+    if not cues:
+        raise ValueError(f"字幕文件为空或格式无效: {input_path}")
+
+    ref_asr_map: dict[int, str] = align_reference_srt(cues, ref_cues) if ref_cues else {}
+    batches = split_cues_by_gaps(cues, max_per_batch=max_per_batch)
+    ref_suffix = f" | 双ASR参考={ref_srt_path.name}({len(ref_asr_map)}处差异)" if ref_srt_path is not None else ""
+    print(
+        f"待译字幕: {input_path.name}（共 {len(cues)} 条，按静音间隙分为 {len(batches)} 批：{[len(b) for b in batches]}{ref_suffix}）",
+        flush=True,
+    )
+
     translated = translator.translate_cues(
         cues,
         system_prompt=system_prompt,
@@ -1478,11 +1550,11 @@ def translate_srt(
     total_cached = sum(int(s.get("cached_tokens", 0)) for s in translator.stats)
     total_dropped = sum(int(s.get("dropped", 0)) for s in translator.stats if s.get("phase") == "translate")
     total_merged = sum(int(s.get("merged", 0)) for s in translator.stats if s.get("phase") == "translate")
-    cache_hits = sum(1 for s in translator.stats if s.get("phase") == "translate" and s.get("cache_hit"))
+    cache_hits = sum(1 for s in translator.stats if s.get("cache_hit"))
     total_s = sum(float(s.get("elapsed_s", 0.0)) for s in translator.stats)
     cache_part = f" ({total_cached} cached)" if total_cached else ""
     merge_summary = f" / 合并 {total_merged} 组" if total_merged else ""
-    hit_summary = f" | 本地缓存命中 {cache_hits} 批" if cache_hits else ""
+    hit_summary = f" | 本地缓存命中 {cache_hits} 步" if cache_hits else ""
     print(
         f"[翻译完成] {out} | 输入 {len(cues)} 条 -> 输出 {len(translated)} 条 (过滤 {total_dropped} 条{merge_summary}) | "
         f"纯推理耗时 {total_s:.1f}s | Token: {total_in} in{cache_part} / {total_out} out{hit_summary}",
@@ -1509,6 +1581,9 @@ def run_translate_cli(
     polish_timing_override: bool | None = None,
     repair_missing_override: bool | None = None,
     max_line_chars_override: float | None = None,
+    resegment_override: bool | None = None,
+    words_json_path: Path | None = None,
+    resegment_max_chars_override: float | None = None,
     use_cache_override: bool | None = None,
     log_llm_override: bool | None = None,
     ref_srt_path: Path | None = None,
@@ -1532,6 +1607,9 @@ def run_translate_cli(
             polish_timing_override=polish_timing_override,
             repair_missing_override=repair_missing_override,
             max_line_chars_override=max_line_chars_override,
+            resegment_override=resegment_override,
+            words_json_path=words_json_path,
+            resegment_max_chars_override=resegment_max_chars_override,
             use_cache_override=use_cache_override,
             log_llm_override=log_llm_override,
             ref_srt_path=ref_srt_path,

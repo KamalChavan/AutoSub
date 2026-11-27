@@ -77,6 +77,8 @@ transcript:
   no_verbatim: false             # 开启后过滤口癖/填充词/结巴
   numbers_format: ""             # 仅 scribe_v3 生效: "digits" | "words" | ""
   keyterms: []                   # 注意：ElevenLabs keyterms 会增加 +25% 计费，按需显式开启
+  # 是否在原语 .srt 同目录保存词级时间戳 .words.json（供后续词级语义重断句使用，默认开启）
+  save_words_json: true
   # 双 ASR 参考轨开关（设为 true 后，`run` / `transcript` 仅执行一次 VAD 切片，并行调用主+参考模型，
   # 并将参考原语字幕自动传给翻译模型做交叉仲裁；例如主轨 elevenlabs/scribe_v3 + 参考轨 gemini-3.5-transcribe）
   ref_enabled: false
@@ -90,6 +92,12 @@ translate:
   max_cues_per_batch: 280
   # 遇到 503 高负载时，当前模型原地尝试次数，满次数后再切换下一级模型
   retry_503: 3
+  # 词级语义重断句：当同目录存在 `.words.json`（或通过 --words-json 指定）时，
+  # 翻译前自动利用词级时间戳做 LLM 词索引语义重断句（彻底消除碎句/跨句，零时间轴漂移；可 --no-resegment 关闭）
+  resegment: true
+  resegment_max_cue_chars: 28       # 单条原语字幕目标上限（等效中文字符数；拉丁/西里尔自动按 0.5 宽计 ≈ 56 字符）
+  resegment_max_cue_duration_s: 5.5 # 单条原语字幕目标最长时长（秒）
+  resegment_hard_gap_s: 1.2         # 超过此静音间隔自动作为硬声学边界不跨段合并
   # 语义级碎句合并（允许模型把短停顿劈开的残尾孤儿词合并，时间戳严格锚定原词起止边界）
   merge_cues: true
   max_merge_gap_s: 1.8

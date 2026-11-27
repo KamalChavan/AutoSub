@@ -21,6 +21,7 @@ from src.config import (
 )
 from src.profile import list_profiles
 from src.providers import provider_capabilities
+from src.resegment import run_resegment_cli
 from src.transcribe import run_transcript_cli, transcribe_media_pair
 from src.translate import normalize_translate_model_specs, run_translate_cli, translate_srt
 from src.vad import probe_silero_vad_runtime
@@ -108,6 +109,13 @@ def _add_transcript_common_args(p: argparse.ArgumentParser) -> None:
         default=None,
         help="可选：临时关闭 YAML 中启用的双 ASR 参考轨",
     )
+    p.add_argument(
+        "--no-words-json",
+        dest="save_words_json",
+        action="store_false",
+        default=None,
+        help="可选：不生成词级时间戳 .words.json 文件（默认开启）",
+    )
 
 
 def _add_translate_args(p: argparse.ArgumentParser) -> None:
@@ -163,6 +171,19 @@ def _add_translate_args(p: argparse.ArgumentParser) -> None:
         help="开启 Pass 0 全片上下文自动分析（提前提取英雄/人名/高频 ASR 错词并缓存复用于所有批次）",
     )
     p.add_argument(
+        "--no-resegment",
+        dest="resegment",
+        action="store_false",
+        default=None,
+        help="关闭基于 .words.json 的翻译前词级语义重断句（当存在 .words.json 时默认开启）",
+    )
+    p.add_argument(
+        "--max-cue-chars",
+        type=float,
+        default=None,
+        help="覆盖词级重断句单条原语字幕目标上限（等效中文字符数，默认 28 ≈ 56 拉丁/西里尔字符）",
+    )
+    p.add_argument(
         "--no-merge-cues",
         dest="merge_cues",
         action="store_false",
@@ -215,7 +236,7 @@ def build_parser() -> argparse.ArgumentParser:
     # 1. transcript
     tr_parser = subparsers.add_parser(
         "transcript",
-        help="将视频/音频通过本地 VAD 裁剪并转写为原语 SRT 字幕",
+        help="将视频/音频通过本地 VAD 裁剪并转写为原语 SRT 字幕与词级 .words.json",
     )
     tr_parser.add_argument("input", help="输入视频或音频文件路径（.mp4/.mkv/.ts/.mp3/.wav 等）")
     tr_parser.add_argument(
@@ -243,14 +264,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="临时禁用本地 SQLite 内容哈希缓存（默认开启）",
     )
     tr_parser.add_argument("-o", "--output", default=None, help="输出原语 .srt 路径（默认同目录同名 .srt）")
+    tr_parser.add_argument("--words-output", default=None, help="可选：词级时间戳 .words.json 保存路径（默认 <output>.words.json）")
     tr_parser.add_argument("--ref-output", default=None, help="可选：双 ASR 参考轨原语 .srt 保存路径（默认 <output>_ref.srt）")
 
     # 2. translate
     tl_parser = subparsers.add_parser(
         "translate",
-        help="根据 Profile 与术语表对原语 SRT 执行去噪、ASR 纠偏与单/双语翻译",
+        help="根据 Profile 与术语表对原语 SRT（或 .words.json）执行词级重断句、去噪、ASR 纠偏与单/双语翻译",
     )
-    tl_parser.add_argument("input", help="输入原语 .srt 文件路径")
+    tl_parser.add_argument("input", help="输入原语 .srt 或 .words.json 文件路径")
     tl_parser.add_argument(
         "-p",
         "--profile",
@@ -266,6 +288,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         default=None,
         help="覆盖翻译模型或逗号分隔降级链（如 openai/gpt-6.2-sol,gemini/gemini-4-hydrogen）",
+    )
+    tl_parser.add_argument(
+        "--words-json",
+        default=None,
+        metavar="PATH",
+        help="可选：显式指定词级时间戳 .words.json 文件（默认自动查找同目录同名 .words.json）",
     )
     tl_parser.add_argument(
         "--ref-srt",
@@ -286,7 +314,7 @@ def build_parser() -> argparse.ArgumentParser:
     # 3. run (one-shot transcript -> translate)
     run_parser = subparsers.add_parser(
         "run",
-        help="一键串行执行 transcript（提取原语 SRT）-> translate（翻译为目标/双语 SRT）",
+        help="一键串行执行 transcript（提取原语 SRT 与 .words.json）-> 词级重断句与 translate",
     )
     run_parser.add_argument("input", help="输入视频或音频文件路径")
     run_parser.add_argument(
@@ -327,25 +355,69 @@ def build_parser() -> argparse.ArgumentParser:
         help="临时禁用本地 SQLite 内容哈希缓存（默认开启）",
     )
     run_parser.add_argument("--srt-output", default=None, help="可选：中间原语 .srt 保存路径")
+    run_parser.add_argument("--words-output", default=None, help="可选：中间词级 .words.json 保存路径")
     run_parser.add_argument("--ref-srt-output", default=None, help="可选：双 ASR 参考轨中间 .srt 保存路径")
     run_parser.add_argument("-o", "--output", default=None, help="可选：最终翻译 .srt 保存路径")
 
-    # 4. providers
+    # 4. resegment (standalone word-level LLM semantic re-segmentation)
+    reseg_parser = subparsers.add_parser(
+        "resegment",
+        help="基于 .words.json 词级时间戳执行 LLM 词索引语义重断句，输出零漂移原语 .srt",
+    )
+    reseg_parser.add_argument("input", help="输入 .words.json（或同目录附带 .words.json 的 .srt）路径")
+    reseg_parser.add_argument("-p", "--profile", default=None, help="可选：Profile 名称或外部 YAML 路径")
+    reseg_parser.add_argument("--provider", default=None, help="覆盖 LLM 厂商（如 openai / gemini / openai_compatible）")
+    reseg_parser.add_argument("--model", default=None, help="覆盖 LLM 模型或降级链（如 openai/gpt-6.2-sol）")
+    reseg_parser.add_argument(
+        "--reasoning-effort",
+        choices=["low", "medium", "high", "xhigh", "max"],
+        default=None,
+        help="覆盖 OpenAI GPT-6 推理深度",
+    )
+    reseg_parser.add_argument(
+        "--max-cue-chars",
+        type=float,
+        default=None,
+        help="单条原语字幕目标上限（等效中文字符数，默认 28 ≈ 56 拉丁/西里尔字符）",
+    )
+    reseg_parser.add_argument(
+        "--max-cue-duration",
+        type=float,
+        default=None,
+        help="单条原语字幕目标最长时长秒数（默认 5.5）",
+    )
+    reseg_parser.add_argument(
+        "--no-cache",
+        dest="use_cache",
+        action="store_false",
+        default=None,
+        help="临时禁用本地 SQLite 内容哈希缓存（默认开启）",
+    )
+    reseg_parser.add_argument(
+        "--log-llm",
+        dest="log_llm",
+        action="store_true",
+        default=None,
+        help="开启完整 LLM 请求与响应轮转 JSONL 调试日志",
+    )
+    reseg_parser.add_argument("-o", "--output", default=None, help="输出重断句后的 .srt 路径（默认 <stem>_resegmented.srt）")
+
+    # 5. providers
     subparsers.add_parser(
         "providers",
         help="列出已配置的多厂商 API 协议、支持能力与 API Key 状态",
     )
 
-    # 5. profiles
+    # 6. profiles
     subparsers.add_parser(
         "profiles",
         help="列出所有内置 Profile 及其可配置的上下文变量",
     )
 
-    # 6. cache
+    # 7. cache
     cache_parser = subparsers.add_parser(
         "cache",
-        help="查看或清理本地 SQLite 内容哈希缓存（ASR / 翻译 / Pass 0）",
+        help="查看或清理本地 SQLite 内容哈希缓存（ASR / 重断句 / 翻译 / Pass 0）",
     )
     cache_parser.add_argument(
         "action",
@@ -356,7 +428,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cache_parser.add_argument(
         "--namespace",
-        choices=["all", "asr", "translate", "pass0"],
+        choices=["all", "asr", "resegment", "translate", "pass0"],
         default="all",
         help="clear 时指定清理范围（默认 all）",
     )
@@ -510,6 +582,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"      默认 --var 变量: {var_keys}")
         return 0
 
+    if args.command == "resegment":
+        return run_resegment_cli(
+            Path(args.input).resolve(),
+            defaults_path=defaults_path,
+            profile_name=args.profile,
+            provider_override=args.provider,
+            model_override=args.model,
+            reasoning_effort_override=args.reasoning_effort,
+            max_cue_chars_override=args.max_cue_chars,
+            max_cue_duration_override=args.max_cue_duration,
+            use_cache_override=args.use_cache,
+            log_llm_override=args.log_llm,
+            output_path=Path(args.output).resolve() if args.output else None,
+        )
+
     if args.command == "transcript":
         return run_transcript_cli(
             Path(args.input).resolve(),
@@ -517,6 +604,8 @@ def main(argv: list[str] | None = None) -> int:
             profile_name=args.profile,
             output_path=Path(args.output).resolve() if args.output else None,
             ref_output_path=Path(args.ref_output).resolve() if args.ref_output else None,
+            words_output_path=Path(args.words_output).resolve() if args.words_output else None,
+            save_words_json_override=args.save_words_json,
             vad_override=args.vad,
             provider_override=args.provider,
             model_override=args.model,
@@ -551,6 +640,9 @@ def main(argv: list[str] | None = None) -> int:
             polish_timing_override=args.polish_timing,
             repair_missing_override=args.repair_missing,
             max_line_chars_override=args.max_line_chars,
+            resegment_override=args.resegment,
+            words_json_path=Path(args.words_json).resolve() if args.words_json else None,
+            resegment_max_chars_override=args.max_cue_chars,
             use_cache_override=args.use_cache,
             log_llm_override=args.log_llm,
             ref_srt_path=Path(args.ref_srt).resolve() if args.ref_srt else None,
@@ -559,12 +651,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         try:
+            words_out = Path(args.words_output).resolve() if args.words_output else None
             raw_srt, ref_srt = transcribe_media_pair(
                 Path(args.input).resolve(),
                 defaults_path=defaults_path,
                 profile_name=args.profile,
                 output_path=Path(args.srt_output).resolve() if args.srt_output else None,
                 ref_output_path=Path(args.ref_srt_output).resolve() if args.ref_srt_output else None,
+                words_output_path=words_out,
+                save_words_json_override=args.save_words_json,
                 vad_override=args.vad,
                 provider_override=args.transcript_provider,
                 model_override=args.transcript_model,
@@ -599,6 +694,9 @@ def main(argv: list[str] | None = None) -> int:
                 polish_timing_override=args.polish_timing,
                 repair_missing_override=args.repair_missing,
                 max_line_chars_override=args.max_line_chars,
+                resegment_override=args.resegment,
+                words_json_path=words_out if (words_out is not None and words_out.is_file()) else None,
+                resegment_max_chars_override=args.max_cue_chars,
                 use_cache_override=args.use_cache,
                 log_llm_override=args.log_llm,
                 ref_srt_path=ref_srt,
