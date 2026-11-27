@@ -1,13 +1,53 @@
 # AutoSub 全局默认引擎配置（与领域无关）
 # 特定任务的 Prompt、术语表、目标语言与上下文变量请配置在 profiles/*.yaml 中。
+# 向后兼容：旧版顶层 `api.*` 字段依然受支持，会自动映射到 `providers.gemini` 与 `network.*`。
 
-api:
-  # Gemini API Key（留空则按优先级读取环境变量 GEMINI_API_KEY / GOOGLE_API_KEY 或 .env 文件）
-  api_key: ""
-  api_base: "https://generativelanguage.googleapis.com/v1beta"
-  # 可选代理地址（留空则继承系统 HTTP_PROXY / HTTPS_PROXY）
+network:
+  # 全局默认代理地址（留空则继承系统 HTTP_PROXY / HTTPS_PROXY；单厂商可单独覆盖）
   proxy: ""
   timeout_seconds: 180
+
+providers:
+  gemini:
+    protocol: "gemini"
+    # 留空则按优先级读取环境变量 GEMINI_API_KEY / GOOGLE_API_KEY 或 .env 文件
+    api_key: ""
+    api_key_envs: ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
+    api_base: "https://generativelanguage.googleapis.com/v1beta"
+    proxy: ""
+
+  elevenlabs:
+    protocol: "elevenlabs"
+    # 语音转录专用（Scribe v3 / v2 原生词级时间戳）；读取 ELEVENLABS_API_KEY 或 .env
+    api_key: ""
+    api_key_envs: ["ELEVENLABS_API_KEY"]
+    api_base: "https://api.elevenlabs.io/v1"
+    proxy: ""
+
+  openai:
+    protocol: "openai"
+    # 字幕翻译（推荐 gpt-6.2-sol / gpt-6-luna）及支持 verbose_json 时间戳的 Whisper 模型
+    api_key: ""
+    api_key_envs: ["OPENAI_API_KEY"]
+    api_base: "https://api.openai.com/v1"
+    # responses（推荐，支持 GPT-6.2 Prompt Caching）| chat_completions
+    api_mode: "responses"
+    proxy: ""
+
+  openai_compatible:
+    protocol: "openai_compatible"
+    # 通用 OpenAI 兼容网关（DeepSeek / OpenRouter / Groq / DashScope / Ollama / vLLM 等）
+    api_key: ""
+    api_key_envs: ["OPENAI_COMPAT_API_KEY"]
+    api_base: ""
+    api_mode: "chat_completions"
+    proxy: ""
+
+  # 也可按需新增自定义厂商别名，例如：
+  # deepseek:
+  #   protocol: "openai_compatible"
+  #   api_key_envs: ["DEEPSEEK_API_KEY"]
+  #   api_base: "https://api.deepseek.com/v1"
 
 tools:
   # 留空则从系统 PATH 自动查找
@@ -23,10 +63,25 @@ transcript:
   # silencedetect 音量门限（仅 vad_mode=silencedetect 或 silero_onnx 不可用降级时生效）
   silence_noise_db: -30
   silence_min_duration_s: 1.5
-  # 单次转写分段上限（秒；词级时间戳硬上限 1800s，留余量 1680s = 28 分钟）
+  # 单次转写分段上限（秒；Gemini 词级时间戳硬上限 1800s，留余量 1680s = 28 分钟；Whisper 类自动受 24MB 上限约束）
   max_chunk_seconds: 1680
-  model: "gemini-3.5-transcribe"
+  # 默认转录厂商与模型（默认 ElevenLabs Scribe v3；可改为 provider: "gemini", model: "gemini-3.5-transcribe" 或通过 --model 临时覆盖）
+  provider: "elevenlabs"
+  model: "scribe_v3"
   max_retries: 6
+  # ElevenLabs Scribe / Whisper 可选参数（Gemini 模式下自动忽略）
+  language_code: ""              # 留空自动识别，如 "rus" / "eng" / "zho"
+  secondary_language_codes: []   # 仅 scribe_v3 生效，混语场景如 ["eng"]
+  tag_audio_events: false        # 字幕场景默认关闭 [laughter]/[music] 等事件标签
+  diarize: false                 # 开启后按说话人切换自动断句
+  no_verbatim: false             # 开启后过滤口癖/填充词/结巴
+  numbers_format: ""             # 仅 scribe_v3 生效: "digits" | "words" | ""
+  keyterms: []                   # 注意：ElevenLabs keyterms 会增加 +25% 计费，按需显式开启
+  # 双 ASR 参考轨开关（设为 true 后，`run` / `transcript` 仅执行一次 VAD 切片，并行调用主+参考模型，
+  # 并将参考原语字幕自动传给翻译模型做交叉仲裁；例如主轨 elevenlabs/scribe_v3 + 参考轨 gemini-3.5-transcribe）
+  ref_enabled: false
+  ref_provider: ""               # 留空自动从 ref_model 推断，如 "gemini"
+  ref_model: ""                  # 如 "gemini-3.5-transcribe"
 
 translate:
   # 默认使用的 Profile（profiles/<name>.yaml 或任意外部 YAML 路径）
@@ -35,11 +90,26 @@ translate:
   max_cues_per_batch: 280
   # 遇到 503 高负载时，当前模型原地尝试次数，满次数后再切换下一级模型
   retry_503: 3
-  # 模型降级链：RPD 耗尽 (429) 当轮直接跳过；503 重试满 3 次后切下一级
+  # 语义级碎句合并（允许模型把短停顿劈开的残尾孤儿词合并，时间戳严格锚定原词起止边界）
+  merge_cues: true
+  max_merge_gap_s: 1.8
+  max_merge_duration_s: 6.5
+  # 确定性字幕排轴后处理（最短驻留、CPS 读速延展、微间隙桥接，零 API 成本）
+  polish_timing: true
+  # Pass 0 全片上下文自动提取（需额外 1 次调用，建议搭配 OpenAI gpt-6.2-sol 或通过 --auto-context 开启）
+  auto_context: false
+  # 跨厂商模型降级链：RPD/额度耗尽 (429/402) 当轮直接跳过；503 重试满 3 次后切下一级
+  # 支持按条目指定 provider（例如启用 OpenAI gpt-6.2-sol 作为主力，Gemini 兜底）：
+  #   - provider: "openai"
+  #     model: "gpt-6.2-sol"
+  #     reasoning_effort: "low"
   models:
-    - model: "gemini-4-hydrogen"
+    - provider: "gemini"
+      model: "gemini-4-hydrogen"
       service_tier: "standard"
-    - model: "gemini-3.8-flash"
+    - provider: "gemini"
+      model: "gemini-3.8-flash"
       service_tier: "standard"
-    - model: "gemini-3.5-flash-lite"
+    - provider: "gemini"
+      model: "gemini-3.5-flash-lite"
       service_tier: "standard"
